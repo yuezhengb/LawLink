@@ -3,7 +3,7 @@
 
 FROM node:22-alpine AS deps
 WORKDIR /app
-RUN apk add --no-cache libc6-compat
+RUN apk add --no-cache libc6-compat openssl
 COPY package*.json ./
 COPY prisma ./prisma
 RUN npm ci
@@ -23,7 +23,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 # 自动备份链依赖（2026-09-20 第六轮体检 P1-1）：backup.sh 以 bash 运行并调用
 # pg_dump。postgresql16-client 对齐 db 服务的 postgres:16（pg_dump 客户端主版本
 # 须等于或高于服务器）。缺了这两样，镜像里备份每天失败。
-RUN apk add --no-cache bash postgresql16-client
+RUN apk add --no-cache bash openssl postgresql16-client
 
 RUN addgroup --system --gid 1001 nodejs && adduser --system --uid 1001 nextjs
 
