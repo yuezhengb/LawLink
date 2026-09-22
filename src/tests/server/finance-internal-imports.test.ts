@@ -36,6 +36,10 @@ function transactionDb() {
       create: vi.fn().mockResolvedValue({ id: "source-file-new" })
     },
     financeSourceRow: {
+      createMany: vi.fn().mockResolvedValue({ count: 1 }),
+      findMany: vi.fn().mockResolvedValue([{ id: "source-row-new" }])
+    },
+    financeReconciliationCase: {
       createMany: vi.fn().mockResolvedValue({ count: 1 })
     },
     auditLog: {

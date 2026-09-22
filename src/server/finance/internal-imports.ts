@@ -227,6 +227,18 @@ export async function commitFinanceImport(
       await tx.financeSourceRow.createMany({
         data: parsed.rows.map((row) => dataForSourceRow(row, batch.id, sourceFile.id))
       });
+      const sourceRows = await tx.financeSourceRow.findMany({
+        where: { batchId: batch.id },
+        select: { id: true }
+      });
+      await tx.financeReconciliationCase.createMany({
+        data: sourceRows.map((sourceRow) => ({
+          batchId: batch.id,
+          sourceRowId: sourceRow.id,
+          status: "UNRESOLVED",
+          suggestions: []
+        }))
+      });
       await auditTx(tx, {
         userId: actorId,
         action: "FINANCE_INTERNAL_IMPORT_COMMIT",
