@@ -455,6 +455,20 @@ model User {
   handoversReceived MatterHandover[] @relation("HandoverReceiver")
   intakeSubmissions IntakeRevision[]
   confirmedFinanceCorrections FinanceCorrection[] @relation("FinanceCorrectionConfirmer")
+  financeImportBatchesCreated FinanceImportBatch[] @relation("FinanceImportBatchCreator")
+  financeClaimDecisions FinanceClaimDecision[] @relation("FinanceClaimDecisionDecider")
+  financeMatterProfilesUpdated FinanceMatterProfile[] @relation("FinanceMatterProfileUpdater")
+  financeRuleSetsCreated FinanceRuleSet[] @relation("FinanceRuleSetCreator")
+  financeRuleVersionsPublished FinanceRuleVersion[] @relation("FinanceRuleVersionPublisher")
+  financeCalculationRunsCreated FinanceCalculationRun[] @relation("FinanceCalculationRunCreator")
+  financeAllocationLinesTargeted FinanceAllocationLine[] @relation("FinanceAllocationTarget")
+  financePersonLedgerEntries FinancePersonLedgerEntry[] @relation("FinancePersonLedgerTarget")
+  financePayrollFacts FinancePayrollFact[] @relation("FinancePayrollUser")
+  financePartnerTaxRecords FinancePartnerTaxRecord[] @relation("FinancePartnerTaxUser")
+  financeCapitalFlows FinanceCapitalFlow[] @relation("FinanceCapitalInvestor")
+  financeAdjustmentsCreated FinanceAdjustment[] @relation("FinanceAdjustmentCreator")
+  financeAdjustmentsTargeted FinanceAdjustment[] @relation("FinanceAdjustmentTarget")
+  financeMonthlyClosesCreated FinanceMonthlyClose[] @relation("FinanceMonthlyCloseCreator")
   invoicePaymentAllocations InvoicePaymentAllocation[] @relation("InvoiceAllocationRecorder")
   commissionSettlements CommissionSettlement[] @relation("CommissionSettlementRecorder")
   confirmedReceivableConditions Receivable[] @relation("ReceivableConditionConfirmer")
@@ -765,6 +779,9 @@ model Matter {
   urgentItems IntakeUrgentItem[]
   conflictReviews ConflictCheck[]
   financeCorrections FinanceCorrection[]
+  financeReconciliationCases FinanceReconciliationCase[]
+  financeMatterProfile FinanceMatterProfile?
+  financeAllocationLines FinanceAllocationLine[]
   id                   String         @id @default(cuid())
   internalCode         String         @unique
   firmCaseNo           String?        @unique // v0.42 所内案号（按可配置模板生成）
@@ -1494,6 +1511,9 @@ model Payment {
   sourceEntry FeeEntry @relation("PaymentSourceEntry", fields: [feeEntryId], references: [id], onDelete: Restrict)
   invoiceAllocations InvoicePaymentAllocation[]
   corrections FinanceCorrection[] @relation("CorrectionPayment")
+  financeReconciliationCases FinanceReconciliationCase[]
+  financeRefundLinks FinanceRefundLink[]
+  financeAllocationLines FinanceAllocationLine[]
   correctionEffects FinanceCorrectionEffect[] @relation("EffectPayment")
   @@unique([id, matterId])
   moneyKind MoneyKind
@@ -2991,4 +3011,478 @@ model InvoiceAdjustment {
  createdAt DateTime @default(now())
  @@unique([invoiceId, reference])
  @@index([replacementInvoiceId])
+}
+
+// ============================================================
+// 律所经营财务闭环：来源证据、对账、规则快照与月结交付
+// ============================================================
+
+enum FinanceImportKind {
+  BANK_STATEMENT
+  PAYROLL
+  ROSTER
+  EXTERNAL_THREE_STATEMENTS
+  OTHER
+}
+
+enum FinanceImportBatchStatus {
+  PREVIEW
+  COMMITTED
+  FAILED
+  REJECTED
+}
+
+enum FinanceDirection {
+  CREDIT
+  DEBIT
+  UNKNOWN
+}
+
+enum FinanceReconciliationStatus {
+  UNRESOLVED
+  SUGGESTED
+  CONFIRMED
+  IGNORED
+  SUSPECT
+  EXCEPTION
+}
+
+enum FinanceDecisionKind {
+  CONFIRM
+  IGNORE
+  SUSPECT
+}
+
+enum FinanceCalculationRunStatus {
+  PREVIEW
+  COMMITTED
+  FAILED
+  SUPERSEDED
+}
+
+enum FinanceCalculationTrigger {
+  PREVIEW
+  MANUAL
+  MONTHLY_CLOSE
+}
+
+enum FinanceMatterOrigin {
+  DIRECT
+  CHANNEL
+  SOURCE
+  REFERRAL
+  OTHER
+}
+
+enum FinanceLedgerEntryKind {
+  EARNED_INCOME
+  SELF_COST
+  SELF_FUNDING_IN
+  SELF_FUNDING_USED
+  INCOME_WITHDRAWAL
+  PARTNER_TAX_ADVANCE
+  PERSONAL_TAX_PAID
+  CAPITAL_IN
+  CAPITAL_OUT
+  ADJUSTMENT
+}
+
+enum FinanceTaxPhase {
+  ESTIMATED
+  ADVANCED
+  PERSONALLY_PAID
+  SETTLED
+}
+
+enum FinanceCapitalFlowKind {
+  CAPITAL_IN
+  CAPITAL_OUT
+  INCOME_WITHDRAWAL
+}
+
+enum FinanceAdjustmentStatus {
+  POSTED
+  REVERSED
+}
+
+enum FinanceCloseStatus {
+  OPEN
+  READY
+  CLOSED
+}
+
+enum FinanceArtifactKind {
+  WAGE
+  ACCOUNTANT
+  PERSONAL
+  ADJUSTMENT_AUDIT
+  ZIP
+}
+
+enum FinanceRuleRoundingMode {
+  HALF_UP
+  DOWN
+  UP
+}
+
+model FinanceImportBatch {
+  id String @id @default(cuid())
+  sourceHash String @db.VarChar(64)
+  kind FinanceImportKind
+  fileName String @db.VarChar(255)
+  status FinanceImportBatchStatus @default(PREVIEW)
+  periodStart DateTime?
+  periodEnd DateTime?
+  rowCount Int @default(0)
+  errorCount Int @default(0)
+  createdById String
+  createdBy User @relation("FinanceImportBatchCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  sourceFile FinanceSourceFile?
+  sourceRows FinanceSourceRow[]
+  reconciliationCases FinanceReconciliationCase[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([sourceHash, kind])
+  @@index([periodStart, status])
+  @@index([kind, status])
+}
+
+model FinanceSourceFile {
+  id String @id @default(cuid())
+  batchId String @unique
+  batch FinanceImportBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  fileName String @db.VarChar(255)
+  storagePath String @db.VarChar(500)
+  mimeType String @db.VarChar(120)
+  byteSize Int
+  sha256 String @db.VarChar(64)
+  createdAt DateTime @default(now())
+  rows FinanceSourceRow[]
+
+  @@index([sha256])
+}
+
+model FinanceSourceRow {
+  id String @id @default(cuid())
+  batchId String
+  batch FinanceImportBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  sourceFileId String
+  sourceFile FinanceSourceFile @relation(fields: [sourceFileId], references: [id], onDelete: Restrict)
+  sourceRow Int
+  occurredAt DateTime
+  amount Decimal @db.Decimal(14, 2)
+  direction FinanceDirection
+  balance Decimal? @db.Decimal(14, 2)
+  counterpartyDigest String? @db.VarChar(64)
+  counterpartyDisplay String? @db.VarChar(160)
+  accountMasked String? @db.VarChar(40)
+  descriptionDigest String? @db.VarChar(64)
+  descriptionDisplay String? @db.VarChar(300)
+  externalReference String? @db.VarChar(120)
+  invoiceReference String? @db.VarChar(120)
+  metadata Json?
+  reconciliationCase FinanceReconciliationCase?
+  refundLinks FinanceRefundLink[]
+  createdAt DateTime @default(now())
+
+  @@unique([batchId, sourceRow])
+  @@index([sourceFileId, sourceRow])
+  @@index([occurredAt])
+}
+
+model FinanceReconciliationCase {
+  id String @id @default(cuid())
+  batchId String
+  batch FinanceImportBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  sourceRowId String @unique
+  sourceRow FinanceSourceRow @relation(fields: [sourceRowId], references: [id], onDelete: Restrict)
+  matterId String?
+  matter Matter? @relation(fields: [matterId], references: [id], onDelete: Restrict)
+  paymentId String?
+  payment Payment? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  status FinanceReconciliationStatus @default(UNRESOLVED)
+  suggestions Json @default("[]")
+  reason String?
+  claimDecisions FinanceClaimDecision[]
+  refundLinks FinanceRefundLink[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([batchId, status])
+  @@index([matterId])
+  @@index([paymentId])
+}
+
+model FinanceClaimDecision {
+  id String @id @default(cuid())
+  caseId String
+  reconciliationCase FinanceReconciliationCase @relation(fields: [caseId], references: [id], onDelete: Restrict)
+  decision FinanceDecisionKind
+  paymentId String?
+  reason String?
+  decidedById String
+  decidedBy User @relation("FinanceClaimDecisionDecider", fields: [decidedById], references: [id], onDelete: Restrict)
+  createdAt DateTime @default(now())
+
+  @@index([caseId, createdAt])
+  @@index([decidedById, createdAt])
+}
+
+model FinanceRefundLink {
+  id String @id @default(cuid())
+  caseId String
+  reconciliationCase FinanceReconciliationCase @relation(fields: [caseId], references: [id], onDelete: Restrict)
+  sourceRowId String
+  sourceRow FinanceSourceRow @relation(fields: [sourceRowId], references: [id], onDelete: Restrict)
+  paymentId String
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  amount Decimal @db.Decimal(14, 2)
+  reason String
+  active Boolean @default(true)
+  createdById String
+  createdAt DateTime @default(now())
+
+  @@unique([sourceRowId, paymentId])
+  @@index([paymentId, active])
+}
+
+model FinanceMatterProfile {
+  id String @id @default(cuid())
+  matterId String @unique
+  matter Matter @relation(fields: [matterId], references: [id], onDelete: Restrict)
+  origin FinanceMatterOrigin
+  lawyerLevel String? @db.VarChar(60)
+  channelLabel String? @db.VarChar(120)
+  participantIds Json @default("[]")
+  internalNote String? @db.VarChar(1000)
+  activeRuleSetId String?
+  updatedById String
+  updatedBy User @relation("FinanceMatterProfileUpdater", fields: [updatedById], references: [id], onDelete: Restrict)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([origin])
+}
+
+model FinanceRuleSet {
+  id String @id @default(cuid())
+  name String @db.VarChar(120)
+  kind String @db.VarChar(60)
+  createdById String
+  createdBy User @relation("FinanceRuleSetCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  versions FinanceRuleVersion[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([kind, createdAt])
+}
+
+model FinanceRuleVersion {
+  id String @id @default(cuid())
+  ruleSetId String
+  ruleSet FinanceRuleSet @relation(fields: [ruleSetId], references: [id], onDelete: Restrict)
+  version Int
+  definition Json
+  effectiveFrom DateTime
+  effectiveTo DateTime?
+  roundingMode FinanceRuleRoundingMode @default(HALF_UP)
+  sourceNote String @db.VarChar(1000)
+  publishedAt DateTime?
+  publishedById String?
+  publishedBy User? @relation("FinanceRuleVersionPublisher", fields: [publishedById], references: [id], onDelete: Restrict)
+  createdAt DateTime @default(now())
+
+  @@unique([ruleSetId, version])
+  @@index([effectiveFrom, effectiveTo])
+}
+
+model FinanceCalculationRun {
+  id String @id @default(cuid())
+  periodStart DateTime
+  periodEnd DateTime
+  sourceHash String @db.VarChar(64)
+  ruleVersionIds String[] @default([])
+  status FinanceCalculationRunStatus @default(PREVIEW)
+  trigger FinanceCalculationTrigger
+  summary Json @default("{}")
+  calculatedAt DateTime @default(now())
+  supersededById String?
+  supersededBy FinanceCalculationRun? @relation("FinanceRunSuperseded", fields: [supersededById], references: [id], onDelete: SetNull)
+  supersedes FinanceCalculationRun[] @relation("FinanceRunSuperseded")
+  createdById String
+  createdBy User @relation("FinanceCalculationRunCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  allocationLines FinanceAllocationLine[]
+  personLedgerEntries FinancePersonLedgerEntry[]
+  monthlyClose FinanceMonthlyClose?
+  artifacts FinanceArtifact[]
+
+  @@unique([periodStart, periodEnd, sourceHash])
+  @@index([periodStart, periodEnd, status])
+  @@index([sourceHash])
+}
+
+model FinanceAllocationLine {
+  id String @id @default(cuid())
+  runId String
+  run FinanceCalculationRun @relation(fields: [runId], references: [id], onDelete: Restrict)
+  paymentId String
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  matterId String
+  matter Matter @relation(fields: [matterId], references: [id], onDelete: Restrict)
+  targetUserId String?
+  targetUser User? @relation("FinanceAllocationTarget", fields: [targetUserId], references: [id], onDelete: Restrict)
+  ruleVersionId String
+  grossAmount Decimal @db.Decimal(14, 2)
+  channelAmount Decimal @default(0) @db.Decimal(14, 2)
+  firmAmount Decimal @default(0) @db.Decimal(14, 2)
+  sourceAmount Decimal @default(0) @db.Decimal(14, 2)
+  handlingAmount Decimal @default(0) @db.Decimal(14, 2)
+  coAmount Decimal @default(0) @db.Decimal(14, 2)
+  createdAt DateTime @default(now())
+
+  @@index([runId])
+  @@index([paymentId])
+  @@index([matterId])
+  @@index([targetUserId])
+}
+
+model FinancePersonLedgerEntry {
+  id String @id @default(cuid())
+  runId String?
+  run FinanceCalculationRun? @relation(fields: [runId], references: [id], onDelete: Restrict)
+  targetUserId String
+  targetUser User @relation("FinancePersonLedgerTarget", fields: [targetUserId], references: [id], onDelete: Restrict)
+  period String @db.VarChar(7)
+  kind FinanceLedgerEntryKind
+  amount Decimal @db.Decimal(14, 2)
+  sourceRef String? @db.VarChar(120)
+  note String? @db.VarChar(1000)
+  createdById String
+  createdAt DateTime @default(now())
+
+  @@index([targetUserId, period])
+  @@index([runId])
+}
+
+model FinancePayrollFact {
+  id String @id @default(cuid())
+  userId String
+  user User @relation("FinancePayrollUser", fields: [userId], references: [id], onDelete: Restrict)
+  period String @db.VarChar(7)
+  grossSalary Decimal @default(0) @db.Decimal(14, 2)
+  commission Decimal @default(0) @db.Decimal(14, 2)
+  socialPersonal Decimal @default(0) @db.Decimal(14, 2)
+  socialCompany Decimal @default(0) @db.Decimal(14, 2)
+  fundPersonal Decimal @default(0) @db.Decimal(14, 2)
+  fundCompany Decimal @default(0) @db.Decimal(14, 2)
+  incomeTax Decimal @default(0) @db.Decimal(14, 2)
+  otherDeduction Decimal @default(0) @db.Decimal(14, 2)
+  reimbursement Decimal @default(0) @db.Decimal(14, 2)
+  actualPaymentPeriod String? @db.VarChar(7)
+  sourceBatchId String?
+  createdById String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, period])
+  @@index([period])
+}
+
+model FinancePartnerTaxRecord {
+  id String @id @default(cuid())
+  userId String
+  user User @relation("FinancePartnerTaxUser", fields: [userId], references: [id], onDelete: Restrict)
+  period String @db.VarChar(7)
+  estimatedTax Decimal @default(0) @db.Decimal(14, 2)
+  firmAdvance Decimal @default(0) @db.Decimal(14, 2)
+  personallyPaid Decimal @default(0) @db.Decimal(14, 2)
+  personallyPaidAt DateTime?
+  phase FinanceTaxPhase
+  evidenceRef String? @db.VarChar(200)
+  createdById String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, period])
+}
+
+model FinanceCapitalFlow {
+  id String @id @default(cuid())
+  investorId String
+  investor User @relation("FinanceCapitalInvestor", fields: [investorId], references: [id], onDelete: Restrict)
+  period String @db.VarChar(7)
+  amount Decimal @db.Decimal(14, 2)
+  kind FinanceCapitalFlowKind
+  throughPartnerId String?
+  linkedBankSourceRowId String?
+  remarks String? @db.VarChar(1000)
+  createdById String
+  createdAt DateTime @default(now())
+
+  @@index([period, kind])
+  @@index([investorId, period])
+}
+
+model FinanceAdjustment {
+  id String @id @default(cuid())
+  period String @db.VarChar(7)
+  account String @db.VarChar(120)
+  targetUserId String?
+  targetUser User? @relation("FinanceAdjustmentTarget", fields: [targetUserId], references: [id], onDelete: Restrict)
+  amount Decimal @db.Decimal(14, 2)
+  reason String @db.VarChar(1000)
+  evidenceRef String? @db.VarChar(200)
+  reversalOfId String?
+  reversalOf FinanceAdjustment? @relation("FinanceAdjustmentReversal", fields: [reversalOfId], references: [id], onDelete: Restrict)
+  reversals FinanceAdjustment[] @relation("FinanceAdjustmentReversal")
+  status FinanceAdjustmentStatus @default(POSTED)
+  createdById String
+  createdBy User @relation("FinanceAdjustmentCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([period, status])
+  @@index([targetUserId, period])
+}
+
+model FinanceMonthlyClose {
+  id String @id @default(cuid())
+  period String @unique @db.VarChar(7)
+  runId String? @unique
+  run FinanceCalculationRun? @relation(fields: [runId], references: [id], onDelete: Restrict)
+  sourceHash String? @db.VarChar(64)
+  status FinanceCloseStatus @default(OPEN)
+  transactionCount Int @default(0)
+  unresolvedCount Int @default(0)
+  unresolvedIncomeCount Int @default(0)
+  splitErrorCount Int @default(0)
+  missingPayrollCount Int @default(0)
+  templateWarnings Json @default("[]")
+  blockingWarnings Json @default("[]")
+  reviewWarnings Json @default("[]")
+  createdById String
+  createdBy User @relation("FinanceMonthlyCloseCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  artifacts FinanceArtifact[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, updatedAt])
+}
+
+model FinanceArtifact {
+  id String @id @default(cuid())
+  runId String
+  run FinanceCalculationRun @relation(fields: [runId], references: [id], onDelete: Restrict)
+  monthlyCloseId String?
+  monthlyClose FinanceMonthlyClose? @relation(fields: [monthlyCloseId], references: [id], onDelete: Restrict)
+  kind FinanceArtifactKind
+  fileName String @db.VarChar(255)
+  storagePath String @db.VarChar(500)
+  sha256 String @db.VarChar(64)
+  byteSize Int
+  createdAt DateTime @default(now())
+
+  @@unique([runId, kind])
+  @@index([monthlyCloseId])
 }

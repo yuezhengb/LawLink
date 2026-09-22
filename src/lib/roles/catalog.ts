@@ -18,6 +18,11 @@ export const PERMISSIONS = [
   { key: "finance.correct", label: "确认财务更正", group: "财务", scopes: ["ALL"] },
   { key: "finance.settle", label: "登记分成支付及扣回", group: "财务", scopes: ["ALL"] },
   { key: "finance.confirm", label: "确认实收到账", group: "财务", scopes: ["ALL"] },
+  { key: "finance.import", label: "导入财务资料", group: "财务", scopes: ["ALL"] },
+  { key: "finance.reconcile", label: "确认财务勾稽与差异", group: "财务", scopes: ["ALL"] },
+  { key: "finance.rules", label: "维护内部核算规则", group: "财务", scopes: ["ALL"] },
+  { key: "finance.adjust", label: "登记财务调整", group: "财务", scopes: ["ALL"] },
+  { key: "finance.export", label: "导出经营财务资料", group: "财务", scopes: ["ALL"] },
   { key: "invoices.process", label: "执行开票", group: "财务", scopes: ["OWN", "ALL"] },
   { key: "archive.read", label: "查看归档", group: "归档与导出", scopes: ["OWN", "TEAM", "ALL"] },
   { key: "archive.submit", label: "提交归档", group: "归档与导出", scopes: ["OWN"] },
@@ -118,7 +123,7 @@ export const SOLE_PRACTICE_GRANTS: RoleGrant[] = [
 export function copyBuiltinGrants(role: string): RoleGrant[] {
   if (role === ADMINISTRATIVE_ROLE_ID) return ADMINISTRATIVE_GRANTS.map(grant => ({ ...grant }));
   const keys: PermissionKey[] = role === "FINANCE"
-    ? ["finance.read", "finance.write", "finance.confirm", "finance.correct", "finance.settle", "invoices.process"]
+    ? ["finance.read", "finance.write", "finance.confirm", "finance.correct", "finance.settle", "finance.import", "finance.reconcile", "finance.rules", "finance.adjust", "finance.export", "invoices.process"]
     : ["matters.read", "intakes.create", "matters.write", "clients.read", "clients.write", "documents.read", "documents.write", "documents.download", "schedule.read", "schedule.write", "archive.read", "archive.submit", "seals.request"];
   return keys.map(permissionKey => ({ permissionKey, scope: (role === "FINANCE" ? "ALL" : permissionKey === "matters.read" && role === "PRINCIPAL_LAWYER" ? "ALL" : "OWN") as RoleScope }));
 }
@@ -127,5 +132,10 @@ export const normalizeRoleName = (name: string) => name.normalize("NFKC").trim()
 
 /** 独立财务执行资格；系统身份及管理权不参与授权。 */
 export function canExecuteFinance(user: RoleUser, key: "finance.correct" | "finance.settle") {
+  return user.role === "FINANCE" || (user.role === "CUSTOM" && scopeFor(user, key) === "ALL");
+}
+
+/** 经营财务写入资格；系统管理员身份和业务管理权不能替代显式授权。 */
+export function canManageInternalFinance(user: RoleUser, key: "finance.rules" | "finance.adjust") {
   return user.role === "FINANCE" || (user.role === "CUSTOM" && scopeFor(user, key) === "ALL");
 }
