@@ -1,26 +1,28 @@
-# 律所内部财务系统第一期 Implementation Plan
+# 律所经营财务闭环 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 在 LawLink 现有案件财务子账之上，交付可复核的财务资料导入、内部收入分配、银行收款勾稽、差异处理和 Excel/CSV 导出闭环。
+**Goal:** 在 LawLink 既有案件财务事实之上，分阶段交付一套可追溯的律所经营财务闭环：资料归档、银行对账、待认领、分成、个人双余额、投资人经营核算和月结交付。
 
-**Architecture:** 保留 LawLink 的 `Matter`、`Billing`、`Receivable`、已确认 `Payment`、`FeeEntry` 和 `CommissionPlan` 作为案件业务事实来源；在同一 PostgreSQL 中新增独立财务域表和服务层。第一期只生成带规则版本的核算/对账快照，不生成正式借贷凭证，不复制 ERPNext 或其他 GPL 系统代码。
+**Architecture:** LawLink 的 `Matter`、`Billing`、`Receivable`、已确认 `Payment`、`FeeEntry`、`CommissionPlan` 继续作为业务事实来源；新增财务域保存来源证据、对账案例、版本化规则、不可变计算批次、个人追加式台账和月结文件。报表与导出只读取服务端持久化计算结果，不在页面临时重算，不复制 101 VPS 的源代码或业务数据。
 
-**Tech Stack:** Next.js 16 App Router、TypeScript、React 19、Prisma 5、PostgreSQL 16、Zod、ExcelJS、SheetJS `xlsx`（仅用于 XLS/XLSX 读取）、Vitest、现有私有存储与审计服务。
+**Tech Stack:** Next.js 16 App Router、TypeScript、React 19、Prisma 5、PostgreSQL 16、Zod、Decimal、ExcelJS、SheetJS `xlsx`（仅用于 CSV/XLS/XLSX 读取）、Vitest、现有私有存储和审计服务。
 
 ## Global Constraints
 
 - LawLink 继续作为客户、案件、合同、案件应收和已确认案件收款的事实来源。
-- 第一阶段不包含自动报税、工资/社保付款、银行开放接口、OCR、正式会计凭证过账、期间结账和法定三表权威输出。
-- 流程资料中的 20%/45%/35%、10% 和 15%—18% 只能作为可配置初始规则，不能写死。
-- 规则一旦被计算批次使用，不允许原地修改；历史计算必须保留原规则版本。
-- 原始文件进入私有存储，数据库只保存必要的标准化字段；日志不得输出完整身份证号、电话、银行卡号或客户敏感文本。
-- 只有已确认的 LawLink 实收才能进入案件收款勾稽和律师分配。
-- 任何更正采用追加记录，不物理删除已经参与导入、匹配或计算的来源数据。
-- 真实客户接单表、银行流水、工资表、花名册和外部账表不得进入 Git；测试只使用合成样本。
-- 业务规则沉淀在 `src/lib/finance` 或 `src/server/finance`，页面不得自行计算金额或状态。
-- 面向用户的页面文案使用中文；不得引入 Ant Design 或 `@ant-design/*`。
-- 修改后必须运行 `npm run lint`、`npm run typecheck`、`npm run prisma:validate` 和 `npm run build`。
+- 只有已确认的 LawLink `Payment` 且 `moneyKind = LAWYER_FEE` 才能进入收款勾稽、分配和个人结算。
+- 阶段 1、2 不输出法定三表；外部三表仅作为核对资料和差异来源。
+- 不做自动报税、自动工资/社保付款、银行开放接口或对外付款。
+- 规则一旦被计算批次使用，不允许原地修改；历史计算必须保留规则版本和来源哈希。
+- 个人可分配收入余额与自担成本预存余额必须分开；投资人资本、收入提取和个人税款不重复计入律所经营结果。
+- 原始文件进入现有私有存储，数据库只保存必要的标准化字段和来源摘要；日志不得输出完整身份证号、电话、银行卡号或客户敏感文本。
+- 任何更正使用追加记录或反向冲销，禁止物理删除已参与导入、匹配或计算的来源数据。
+- 真实客户接单表、银行流水、工资表、花名册和外部账表不得进入 Git、测试夹具、日志或公开下载地址；测试只使用合成/脱敏数据。
+- 101 VPS 上的 `admin.sofos.cc` 只作为业务和交互参考；不从其生产数据库读取数据，不在其运行容器上开发 LawLink。
+- 现有 `next-env.d.ts` 的未提交修改属于用户既有改动；所有任务不得覆盖、格式化或提交该文件。
+- 页面文案使用中文；不引入 Ant Design；核心金额算法只能存在于 `src/lib/finance` 或 `src/server/finance`，页面不得复制金额计算。
+- 每个任务完成后运行该任务的聚焦测试；阶段完成后运行 `npm run lint`、`npm run typecheck`、`npm run prisma:validate` 和 `npm run build`。
 
 ---
 
@@ -28,577 +30,307 @@
 
 ### 新增文件
 
-- `prisma/migrations/20260922000001_finance_internal_reconciliation/migration.sql`：第一期财务域的增量 SQL，仅供独立测试库和获授权环境使用。
-- `src/lib/finance/internal-types.ts`：导入、匹配、规则计算和报告共享的纯 TypeScript 类型。
-- `src/lib/finance/internal-rules.ts`：规则定义 Zod schema、金额分配算法和金额守恒校验；无数据库依赖。
-- `src/lib/finance/import-parser.ts`：CSV/XLS/XLSX 的工作簿读取、列映射和标准化；无数据库依赖。
-- `src/lib/finance/internal-matching.ts`：银行流水与已确认案件收款的确定性候选排序；无数据库依赖。
-- `src/server/finance/internal-schemas.ts`：服务端输入 schema，负责动作参数、日期范围和权限边界校验。
-- `src/server/finance/internal-imports.ts`：财务导入批次写入、私有原文件读出和批次查询。
-- `src/server/finance/internal-actions.ts`：导入、对账、规则和分配相关 Server Actions 的薄入口。
-- `src/server/finance/internal-reconciliation.ts`：查询候选收款、生成建议、确认/忽略/关闭差异。
-- `src/server/finance/internal-rules-actions.ts`：规则集、规则版本和案件财务来源档案的事务写入。
-- `src/server/finance/internal-allocation.ts`：读取已确认收款并生成不可变分配快照。
-- `src/server/finance/internal-reports.ts`：汇总核对报表的数据查询和权限过滤。
-- `src/server/finance/internal-export.ts`：ExcelJS 工作簿生成。
-- `src/app/api/finance/imports/[id]/source/route.ts`：受权限保护的原始导入文件下载。
-- `src/app/api/finance/internal/export/route.ts`：受权限保护的内部核算/对账 Excel 导出。
-- `src/app/(app)/finance/imports/page.tsx`：导入批次页面。
-- `src/app/(app)/finance/imports/_components/import-workspace.tsx`：上传、列映射、预览和提交界面。
-- `src/app/(app)/finance/firm-reconciliation/page.tsx`：律所级对账页面，避免与现有案件应收分配页混淆。
-- `src/app/(app)/finance/firm-reconciliation/_components/firm-reconciliation-workspace.tsx`：建议匹配、人工确认和差异关闭界面。
-- `src/app/(app)/finance/rules/page.tsx`：规则版本页面。
-- `src/app/(app)/finance/rules/_components/rules-workspace.tsx`：规则草稿、发布和案件来源档案界面。
-- `src/app/(app)/finance/internal-ledger/page.tsx`：内部核算结果页面。
-- `src/app/(app)/finance/internal-ledger/_components/internal-ledger-workspace.tsx`：按案件、律师、渠道和月份查看分配快照。
-- `src/app/(app)/finance/_components/internal-finance-links.tsx`：现有财务首页到新财务域页面的入口卡片。
-- `src/tests/lib/finance-internal-rules.test.ts`：规则算法单测。
-- `src/tests/lib/finance-import-parser.test.ts`：CSV/XLS/XLSX 读取与标准化单测。
-- `src/tests/lib/finance-internal-matching.test.ts`：匹配排序和歧义保护单测。
-- `src/tests/lib/finance-internal-permissions.test.ts`：新财务权限目录和内置角色单测。
-- `src/tests/server/finance-internal-imports.test.ts`：批次写入、重复导入和失败回滚单测。
-- `src/tests/server/finance-internal-reconciliation.test.ts`：候选查询、确认和差异关闭单测。
-- `src/tests/server/finance-internal-rules.test.ts`：规则版本不可变与生效区间单测。
-- `src/tests/server/finance-internal-allocation.test.ts`：快照生成、缺少配置和幂等单测。
-- `src/tests/server/finance-internal-reports.test.ts`：汇总和访问范围单测。
-- `src/tests/app/finance-internal-workspaces.test.tsx`：财务域页面的预览、权限和空状态测试。
-- `docs/FINANCE-INTERNAL-OPERATIONS.md`：第一期操作说明、字段映射和差异处理口径。
+- `prisma/migrations/20260922000001_finance_operating_loop/migration.sql`：财务经营闭环增量迁移。
+- `src/lib/finance/internal-types.ts`：来源行、匹配、分配、个人台账、月结和导出共享类型。
+- `src/lib/finance/import-parser.ts`：CSV/XLS/XLSX 读取、列识别和标准化；无数据库依赖。
+- `src/lib/finance/source-fingerprint.ts`：稳定值序列化和来源文件/行指纹。
+- `src/lib/finance/internal-rules.ts`：规则 schema、金额分配、守恒和版本输入；无数据库依赖。
+- `src/lib/finance/internal-matching.ts`：银行来源行与已确认 `Payment` 的确定性候选排序；无数据库依赖。
+- `src/lib/finance/internal-accounting.ts`：个人双余额、成本覆盖、税款和投资人经营结果的纯函数。
+- `src/server/finance/internal-schemas.ts`：所有财务域输入的 Zod schema。
+- `src/server/finance/internal-imports.ts`：批次预览、私有文件写入、标准化行保存和重复导入处理。
+- `src/server/finance/internal-reconciliation.ts`：候选查询、确认/忽略/疑点、退款关联和认领决策。
+- `src/server/finance/internal-rules.ts`：案件来源档案、规则草稿/发布和生效区间校验。
+- `src/server/finance/internal-allocation.ts`：从已确认 `Payment` 生成不可变分配批次。
+- `src/server/finance/internal-accounting-actions.ts`：个人内账、工资、税款、资本流的服务端写入和查询。
+- `src/server/finance/materialization.ts`：按账期生成、读取和替代 `FinanceCalculationRun`。
+- `src/server/finance/monthly-close.ts`：月结状态、阻断项、人工调整/冲销和月度交付文件。
+- `src/server/finance/internal-reports.ts`：人员、项目、律所三视角查询。
+- `src/server/finance/internal-export.ts`：ExcelJS 月结包、透视表和审计表生成。
+- `src/app/api/finance/internal/imports/preview/route.ts`：导入预览 API。
+- `src/app/api/finance/internal/imports/commit/route.ts`：导入提交 API。
+- `src/app/api/finance/internal/imports/[id]/source/route.ts`：受保护原文件下载 API。
+- `src/app/api/finance/internal/reconciliation/route.ts`：待匹配队列和候选 API。
+- `src/app/api/finance/internal/reconciliation/[id]/decision/route.ts`：认领、忽略和疑点决策 API。
+- `src/app/api/finance/internal/reconciliation/export/route.ts`：待认领 Excel 导出 API。
+- `src/app/api/finance/internal/reconciliation/import/route.ts`：人工认领结果 Excel 导入 API。
+- `src/app/api/finance/internal/rules/route.ts`：规则草稿和案件来源档案 API。
+- `src/app/api/finance/internal/rules/[id]/publish/route.ts`：规则版本发布 API。
+- `src/app/api/finance/internal/allocation/preview/route.ts`：分配预览 API。
+- `src/app/api/finance/internal/allocation/commit/route.ts`：分配快照提交 API。
+- `src/app/api/finance/internal/materialize/route.ts`：账期计算批次 API。
+- `src/app/api/finance/internal/monthly-close/route.ts`：月结状态和月结生成 API。
+- `src/app/api/finance/internal/adjustments/route.ts`：追加调整和调整查询 API。
+- `src/app/api/finance/internal/adjustments/[id]/reverse/route.ts`：反向冲销 API。
+- `src/app/api/finance/internal/artifacts/[id]/route.ts`：受保护月结文件下载 API。
+- `src/app/api/finance/internal/accounting/route.ts`：个人双余额查询 API。
+- `src/app/api/finance/internal/payroll/route.ts`：工资事实 API。
+- `src/app/api/finance/internal/tax/route.ts`：合伙人税款事实 API。
+- `src/app/api/finance/internal/capital/route.ts`：投资人资本流 API。
+- `src/app/api/finance/internal/export/route.ts`：受保护财务导出 API。
+- `src/app/(app)/finance/internal/page.tsx`：财务经营闭环总入口。
+- `src/app/(app)/finance/internal/_components/internal-finance-nav.tsx`：六组财务工作区导航。
+- `src/app/(app)/finance/internal/imports/page.tsx`：资料导入工作区。
+- `src/app/(app)/finance/internal/reconciliation/page.tsx`：银行对账与待认领工作区。
+- `src/app/(app)/finance/internal/ledger/page.tsx`：分成、个人内账和三视角工作区。
+- `src/app/(app)/finance/internal/rules/page.tsx`：案件来源档案和规则版本工作区。
+- `src/app/(app)/finance/internal/monthly-close/page.tsx`：月结和财务交付工作区。
+- `src/app/(app)/finance/internal/_components/import-workspace.tsx`：资料上传、列映射和预览交互组件。
+- `src/app/(app)/finance/internal/_components/reconciliation-workspace.tsx`：待认领、候选和决策交互组件。
+- `src/app/(app)/finance/internal/_components/ledger-workspace.tsx`：三视角快照和明细交互组件。
+- `src/app/(app)/finance/internal/_components/rules-workspace.tsx`：案件来源档案和规则版本交互组件。
+- `src/app/(app)/finance/internal/_components/monthly-close-workspace.tsx`：月结阻断项和交付文件交互组件。
+- `src/tests/fixtures/finance-synthetic.ts`：不含真实客户信息的固定合成资料。
+- `src/tests/lib/finance-synthetic-fixture.test.ts`：合成事实边界测试。
+- `src/tests/lib/finance-import-parser.test.ts`：导入解析单测。
+- `src/tests/lib/finance-source-fingerprint.test.ts`：来源文件和行指纹单测。
+- `src/tests/lib/finance-internal-matching.test.ts`：匹配排序单测。
+- `src/tests/lib/finance-internal-rules.test.ts`：分配和守恒单测。
+- `src/tests/lib/finance-internal-accounting.test.ts`：双余额、税款和经营结果单测。
+- `src/tests/server/finance-internal-imports.test.ts`：批次幂等和失败回滚单测。
+- `src/tests/server/finance-internal-reconciliation.test.ts`：对账决策单测。
+- `src/tests/server/finance-internal-rules.test.ts`：规则版本和案件来源档案单测。
+- `src/tests/server/finance-internal-allocation.test.ts`：计算批次单测。
+- `src/tests/server/finance-internal-accounting.test.ts`：个人内账和资本流单测。
+- `src/tests/server/finance-internal-reports.test.ts`：三视角汇总和导出单测。
+- `src/tests/server/finance-monthly-close.test.ts`：月结阻断项、调整和交付单测。
+- `src/tests/app/finance-internal-workspaces.test.tsx`：页面权限、空状态和用户操作测试。
+- `src/tests/server/finance-operating-acceptance.test.ts`：合成资料端到端验收测试。
+- `docs/FINANCE-OPERATING-LOOP.md`：内部操作说明、字段映射、差异口径和边界。
 
-### 修改文件
+### 复用与修改文件
 
-- `prisma/schema.prisma`：新增财务导入、财务来源档案、规则版本、对账案例和分配快照模型，并补齐 `User`/`Matter` 的反向关系。
-- `src/lib/roles/catalog.ts`：新增 `finance.import`、`finance.reconcile`、`finance.rules`、`finance.export`，均为全所范围；财务内置岗位默认拥有，其他岗位不隐式继承。
-- `src/tests/lib/permissions.test.ts`：补充新权限不因系统管理员身份或业务管理权自动放大的断言。
-- `src/app/(app)/finance/page.tsx`：增加新财务域入口和读取权限判断，不改变现有案件财务指标。
-- `package.json` / `package-lock.json`：增加固定版本的 `xlsx` 依赖以读取旧式 `.xls` 文件；现有 `.xlsx` 报表导出继续使用 ExcelJS。
+- `prisma/schema.prisma`：新增财务域模型和 `User`、`Matter`、`Payment` 等反向关系。
+- `package.json` / `package-lock.json`：加入固定版本的 `xlsx`，只用于结构化资料读取。
+- `src/lib/roles/catalog.ts`：增加财务域导入、认领、规则、调整和导出权限；不删除现有 `finance.read/write/confirm/correct/settle`。
+- `src/tests/lib/permissions.test.ts`、`src/tests/lib/custom-roles.test.ts`：补充权限不因管理员身份或业务管理权自动放大的断言。
+- `src/server/finance/facts.ts`：复用已确认收款和退款事实，不改变现有事实读取口径。
+- `src/server/finance/allocation.ts`、`src/server/finance/ledger-*`、`src/lib/finance/ledger.ts`：作为案件子账和 Payment 门禁的事实适配层，不把新财务逻辑散落进去。
+- `src/app/(app)/finance/page.tsx`：增加财务经营闭环入口，不改变现有案件财务指标。
+- `src/app/(app)/finance/_components/finance-view-v4.tsx`：增加入口卡片或导航链接，保留现有案件收付款工作区。
+- `src/app/api/finance/export/route.ts`：不改现有案件财务导出；新闭环使用独立导出路由。
 
-## Task 1: 建立财务域 Prisma 模型和权限边界
+## 阶段 0：底座、权限与合成验收事实
+
+### Task 0: 建立合成资料和财务域边界
+
+**Files:**
+- Create: `src/tests/fixtures/finance-synthetic.ts`
+- Create: `src/tests/lib/finance-synthetic-fixture.test.ts`
+- Create: `src/lib/finance/internal-types.ts`
+
+**Interfaces:**
+- Produces `SyntheticFinanceFixture` containing two users, one client, one matter, one confirmed lawyer-fee `Payment`, one pending receipt, one refund, one expense, one payroll record and one capital flow.
+- Produces `FinanceSourceKind`, `FinanceNormalizedRow`, `FinanceMatchStatus`, `FinanceCalculationStatus`, `FinancePersonLedgerEntryKind` and shared Decimal-safe DTO types.
+
+- [ ] **Step 1: Write the fixed synthetic fixture test**
+
+```ts
+import { describe, expect, it } from "vitest";
+import { makeSyntheticFinanceFixture } from "@/tests/fixtures/finance-synthetic";
+
+describe("财务闭环合成事实", () => {
+  it("同时覆盖确认收款、待确认收款、退款、工资和资本流", () => {
+    const fixture = makeSyntheticFinanceFixture();
+    expect(fixture.confirmedPayment.confirmState).toBe("CONFIRMED");
+    expect(fixture.pendingReceipt.confirmState).toBe("PENDING");
+    expect(fixture.refund.moneyKind).toBe("LAWYER_FEE");
+    expect(fixture.capitalFlow.kind).toBe("CAPITAL_IN");
+  });
+});
+```
+
+- [ ] **Step 2: Run the fixture test before implementation**
+
+Run: `npm run test:run -- src/tests/lib/finance-synthetic-fixture.test.ts`
+Expected: FAIL because the fixture factory and shared types do not exist.
+
+- [ ] **Step 3: Implement only synthetic values and shared types**
+
+Use IDs such as `synthetic-matter-1`, `synthetic-payment-1` and amounts such as `100000.00`; do not put client names, account numbers, phone numbers or production identifiers in the fixture. Keep amounts as `Prisma.Decimal` in server fixtures or decimal strings in pure-function fixtures.
+
+- [ ] **Step 4: Run the test and inspect for sensitive literals**
+
+Run: `npm run test:run -- src/tests/lib/finance-synthetic-fixture.test.ts`
+Expected: PASS. Then run: `rg -n "Sofos@|BEGIN .*PRIVATE KEY|admin\.sofos|\.xlsx|\.pdf" src/tests/fixtures src/tests/lib/finance-synthetic-fixture.test.ts`
+Expected: no output.
+
+- [ ] **Step 5: Commit the boundary fixture**
+
+```powershell
+git add src/lib/finance/internal-types.ts src/tests/fixtures/finance-synthetic.ts src/tests/lib/finance-synthetic-fixture.test.ts
+git commit -m "test: add synthetic finance loop fixture"
+```
+
+## 阶段 1：资料归档、标准化与银行对账
+
+### Task 1: 建立财务域 Prisma 模型和权限边界
 
 **Files:**
 - Modify: `prisma/schema.prisma`
-- Create: `prisma/migrations/20260922000001_finance_internal_reconciliation/migration.sql`
+- Create: `prisma/migrations/20260922000001_finance_operating_loop/migration.sql`
 - Modify: `src/lib/roles/catalog.ts`
 - Modify: `src/tests/lib/permissions.test.ts`
+- Modify: `src/tests/lib/custom-roles.test.ts`
 - Create: `src/tests/lib/finance-internal-permissions.test.ts`
 
 **Interfaces:**
-- Produces Prisma models `FinanceImportBatch`、`FinanceImportRow`、`FinanceMatterProfile`、`FinanceRuleSet`、`FinanceRuleVersion`、`FinanceReconciliationCase`、`FinanceAllocationRun`、`FinanceAllocationLine`。
-- Produces permission keys `finance.import`、`finance.reconcile`、`finance.rules`、`finance.export`，全部只允许 `ALL` scope。
+- Produces models `FinanceImportBatch`, `FinanceSourceFile`, `FinanceSourceRow`, `FinanceReconciliationCase`, `FinanceClaimDecision`, `FinanceRefundLink`, `FinanceMatterProfile`, `FinanceRuleSet`, `FinanceRuleVersion`, `FinanceCalculationRun`, `FinanceAllocationLine`, `FinancePersonLedgerEntry`, `FinancePayrollFact`, `FinancePartnerTaxRecord`, `FinanceCapitalFlow`, `FinanceAdjustment`, `FinanceMonthlyClose` and `FinanceArtifact`.
+- Produces permission keys `finance.import`, `finance.reconcile`, `finance.rules`, `finance.adjust` and `finance.export`, each with explicit `ALL` scope; existing `finance.read/write/confirm/correct/settle` remain unchanged.
 
 - [ ] **Step 1: Write permission regression tests**
 
 ```ts
 import { describe, expect, it } from "vitest";
-import { PERMISSIONS, copyBuiltinGrants, scopeFor } from "@/lib/roles/catalog";
+import { hasCustomPermission, scopeFor } from "@/lib/roles/catalog";
 
-describe("内部财务权限", () => {
-  it("四项财务域权限只提供全所范围", () => {
-    for (const key of ["finance.import", "finance.reconcile", "finance.rules", "finance.export"] as const) {
-      expect(PERMISSIONS.find((item) => item.key === key)?.scopes).toEqual(["ALL"]);
-    }
+describe("经营财务权限", () => {
+  it("自定义律师没有新财务写权限", () => {
+    const user = { role: "CUSTOM", rolePermissions: [{ permissionKey: "finance.read", scope: "ALL" as const }] };
+    expect(hasCustomPermission(user, "finance.read")).toBe(true);
+    expect(hasCustomPermission(user, "finance.import")).toBe(false);
+    expect(hasCustomPermission(user, "finance.adjust")).toBe(false);
   });
 
-  it("财务岗位得到四项权限，主任授权本身不扩展为导入或规则管理", () => {
-    const finance = copyBuiltinGrants("FINANCE");
-    expect(scopeFor({ role: "CUSTOM", rolePermissions: finance }, "finance.import")).toBe("ALL");
-    expect(scopeFor({ role: "CUSTOM", rolePermissions: finance }, "finance.rules")).toBe("ALL");
-    expect(scopeFor({ role: "CUSTOM", rolePermissions: [{ permissionKey: "finance.read", scope: "ALL" }] }, "finance.import")).toBeUndefined();
+  it("业务管理权不能自动产生规则发布和调整权限", () => {
+    const user = { role: "CUSTOM", managerAuthorized: true, rolePermissions: [{ permissionKey: "finance.read", scope: "ALL" as const }] };
+    expect(scopeFor(user, "finance.rules")).toBeUndefined();
+    expect(scopeFor(user, "finance.adjust")).toBeUndefined();
   });
 });
 ```
 
-- [ ] **Step 2: Run the focused test and verify it fails**
+- [ ] **Step 2: Run permission tests to verify the new keys are absent**
 
 Run: `npm run test:run -- src/tests/lib/finance-internal-permissions.test.ts`
+Expected: FAIL because the new permission keys and type members do not exist.
 
-Expected: FAIL because the four permission keys do not yet exist in `PermissionKey`.
+- [ ] **Step 3: Add the schema enums and models**
 
-- [ ] **Step 3: Add the permission definitions and built-in grants**
+Add enums for import status, source kind, reconciliation status, calculation status, matter origin, ledger entry kind, tax phase, capital flow kind and adjustment status. Every model must include `id`, `createdAt`, `updatedAt` where it is mutable, and user relations for creator/decider fields. Use `Decimal @db.Decimal(14, 2)` for monetary values. Add indexes for `(period, status)`, `(matterId)`, `(paymentId)`, `(sourceHash)`, `(batchId, sourceRow)` and `(targetUserId, period)`.
 
-在 `src/lib/roles/catalog.ts` 的财务权限段加入：
+Prisma enum names map to the literal unions exported by `internal-types.ts`; do not create a second conflicting TypeScript enum. Server actions convert Prisma values to the shared DTOs at the boundary.
 
-```ts
-{ key: "finance.import", label: "导入财务资料", group: "财务", scopes: ["ALL"] },
-{ key: "finance.reconcile", label: "确认财务勾稽与差异", group: "财务", scopes: ["ALL"] },
-{ key: "finance.rules", label: "维护内部核算规则", group: "财务", scopes: ["ALL"] },
-{ key: "finance.export", label: "导出内部财务资料", group: "财务", scopes: ["ALL"] },
-```
+`FinanceSourceRow` stores normalized date, signed amount, direction, counterparty digest/display value protected by finance permission, description digest/display value, external reference, source file ID and source row number. It does not store complete raw bank account text.
 
-把四个 key 加入 `copyBuiltinGrants("FINANCE")` 的全所权限数组；不要加入 `MANAGER_GRANTS`，不要加入普通律师和独立执业默认模板。保留现有 `finance.read`、`finance.write`、`finance.confirm`、`finance.correct`、`finance.settle` 的行为。
+`FinanceCalculationRun` stores `periodStart`, `periodEnd`, `sourceHash`, `ruleVersionIds`, `status`, `trigger`, `calculatedAt`, `supersededById` and a JSON summary. `FinanceAdjustment` stores `account`, `targetUserId?`, `amount`, `reason`, `evidenceRef?`, `reversalOfId?`, `status` and audit user IDs.
 
-- [ ] **Step 4: Add the exact enum and model definitions**
+- [ ] **Step 4: Write and apply the migration from the schema**
 
-在财务模型附近加入以下枚举和字段。`sourceType/sourceId` 是有意保留的来源多态键，服务层必须用 Zod 白名单校验；不能用任意字符串直接写入。
+Run `npx prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --script` against a disposable schema comparison environment, save the reviewed delta as `prisma/migrations/20260922000001_finance_operating_loop/migration.sql`, and keep it limited to the new finance tables and indexes. Run `npm run prisma:validate` and `npx prisma generate`.
 
-```prisma
-enum FinanceImportKind { BANK_STATEMENT PAYROLL EXTERNAL_STATEMENT }
-enum FinanceImportStatus { PREVIEW COMMITTED REJECTED }
-enum FinanceImportRowStatus { VALID DUPLICATE INVALID }
-enum FinanceCashDirection { IN OUT }
-enum FinanceMatterOrigin { CHANNEL SELF_SOURCED OTHER }
-enum FinanceRuleKind { CHANNEL_SPLIT SELF_SOURCED_SPLIT PAYROLL SOCIAL_INSURANCE EXPENSE }
-enum FinanceRuleStatus { DRAFT PUBLISHED RETIRED }
-enum FinanceMatchStatus { UNMATCHED SUGGESTED MATCHED EXCEPTION IGNORED }
-enum FinanceAllocationRunStatus { PREVIEW COMMITTED FAILED }
-enum FinanceAllocationLineKind {
-  CHANNEL_COMMISSION
-  FIRM_RETAINED
-  LAWYER_POOL
-  LAWYER_SHARE
-  ASSISTANCE_SHARE
-  REIMBURSEMENT
-  SOCIAL_INSURANCE
-  TAX_RESERVE
-  NET_DISTRIBUTABLE
-  UNALLOCATED
-}
+Expected: validation and client generation pass; existing tables are not dropped, renamed, or altered beyond explicit reverse relations.
 
-model FinanceImportBatch {
-  id String @id @default(cuid())
-  kind FinanceImportKind
-  status FinanceImportStatus @default(PREVIEW)
-  originalName String
-  storagePath String?
-  mimeType String?
-  size Int?
-  sha256 String @unique
-  columnMapping Json
-  periodStart DateTime?
-  periodEnd DateTime?
-  totalRows Int @default(0)
-  validRows Int @default(0)
-  duplicateRows Int @default(0)
-  errorRows Int @default(0)
-  createdById String
-  createdBy User @relation("FinanceImportCreator", fields: [createdById], references: [id], onDelete: Restrict)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  rows FinanceImportRow[]
-  reconciliationCases FinanceReconciliationCase[]
-  allocationRuns FinanceAllocationRun[]
-  @@index([kind, status, createdAt])
-}
+- [ ] **Step 5: Register permissions without widening existing roles implicitly**
 
-model FinanceImportRow {
-  id String @id @default(cuid())
-  batchId String
-  batch FinanceImportBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
-  rowNumber Int
-  occurredAt DateTime?
-  amount Decimal? @db.Decimal(14, 2)
-  direction FinanceCashDirection?
-  counterparty String?
-  description String?
-  accountRef String?
-  externalReference String?
-  category String?
-  fingerprint String
-  status FinanceImportRowStatus
-  errorCodes String[]
-  createdAt DateTime @default(now())
-  reconciliationCases FinanceReconciliationCase[]
-  @@unique([batchId, rowNumber])
-  @@index([fingerprint])
-  @@index([batchId, status])
-}
-
-model FinanceMatterProfile {
-  id String @id @default(cuid())
-  matterId String @unique
-  matter Matter @relation(fields: [matterId], references: [id], onDelete: Restrict)
-  origin FinanceMatterOrigin
-  lawyerLevel String?
-  channelLabel String?
-  note String?
-  updatedById String
-  updatedBy User @relation("FinanceMatterProfileUpdater", fields: [updatedById], references: [id], onDelete: Restrict)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-}
-
-model FinanceRuleSet {
-  id String @id @default(cuid())
-  name String
-  kind FinanceRuleKind
-  description String?
-  active Boolean @default(true)
-  createdById String
-  createdBy User @relation("FinanceRuleSetCreator", fields: [createdById], references: [id], onDelete: Restrict)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  versions FinanceRuleVersion[]
-  @@unique([name, kind])
-}
-
-model FinanceRuleVersion {
-  id String @id @default(cuid())
-  ruleSetId String
-  ruleSet FinanceRuleSet @relation(fields: [ruleSetId], references: [id], onDelete: Restrict)
-  version Int
-  status FinanceRuleStatus @default(DRAFT)
-  effectiveFrom DateTime
-  effectiveTo DateTime?
-  definition Json
-  createdById String
-  createdBy User @relation("FinanceRuleVersionCreator", fields: [createdById], references: [id], onDelete: Restrict)
-  publishedById String?
-  publishedBy User? @relation("FinanceRuleVersionPublisher", fields: [publishedById], references: [id], onDelete: Restrict)
-  createdAt DateTime @default(now())
-  publishedAt DateTime?
-  allocationLines FinanceAllocationLine[]
-  @@unique([ruleSetId, version])
-  @@index([ruleSetId, status, effectiveFrom])
-}
-
-model FinanceReconciliationCase {
-  id String @id @default(cuid())
-  batchId String
-  batch FinanceImportBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
-  sourceRowId String
-  sourceRow FinanceImportRow @relation(fields: [sourceRowId], references: [id], onDelete: Restrict)
-  targetType String
-  targetId String
-  status FinanceMatchStatus @default(UNMATCHED)
-  suggestedReason String?
-  difference Decimal? @db.Decimal(14, 2)
-  reviewedById String?
-  reviewedBy User? @relation("FinanceReconciliationReviewer", fields: [reviewedById], references: [id], onDelete: Restrict)
-  reviewedAt DateTime?
-  resolutionNote String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  @@unique([sourceRowId, targetType, targetId])
-  @@index([batchId, status])
-  @@index([targetType, targetId])
-}
-
-model FinanceAllocationRun {
-  id String @id @default(cuid())
-  sourceBatchId String?
-  sourceBatch FinanceImportBatch? @relation(fields: [sourceBatchId], references: [id], onDelete: Restrict)
-  periodStart DateTime
-  periodEnd DateTime
-  status FinanceAllocationRunStatus @default(PREVIEW)
-  totalInput Decimal @db.Decimal(14, 2)
-  totalOutput Decimal @db.Decimal(14, 2)
-  residual Decimal @db.Decimal(14, 2)
-  inputFingerprint String
-  failureCode String?
-  createdById String
-  createdBy User @relation("FinanceAllocationCreator", fields: [createdById], references: [id], onDelete: Restrict)
-  committedAt DateTime?
-  createdAt DateTime @default(now())
-  lines FinanceAllocationLine[]
-  @@unique([periodStart, periodEnd, inputFingerprint])
-  @@index([periodStart, periodEnd, status])
-}
-
-model FinanceAllocationLine {
-  id String @id @default(cuid())
-  runId String
-  run FinanceAllocationRun @relation(fields: [runId], references: [id], onDelete: Restrict)
-  sourceType String
-  sourceId String
-  matterId String?
-  matter Matter? @relation(fields: [matterId], references: [id], onDelete: Restrict)
-  ruleVersionId String
-  ruleVersion FinanceRuleVersion @relation(fields: [ruleVersionId], references: [id], onDelete: Restrict)
-  kind FinanceAllocationLineKind
-  beneficiaryUserId String?
-  beneficiaryUser User? @relation("FinanceAllocationBeneficiary", fields: [beneficiaryUserId], references: [id], onDelete: Restrict)
-  baseAmount Decimal @db.Decimal(14, 2)
-  amount Decimal @db.Decimal(14, 2)
-  note String?
-  createdAt DateTime @default(now())
-  @@index([runId, kind])
-  @@index([matterId, beneficiaryUserId])
-  @@unique([runId, sourceType, sourceId, kind, beneficiaryUserId])
-}
-```
-
-在 `User` 和 `Matter` 增加与上述 relation 名称对应的反向字段；不要删除或重命名现有财务关系。对 `FinanceImportBatch`、`FinanceImportRow`、`FinanceReconciliationCase` 的删除策略统一为 `Restrict`，保证导入来源可追溯。
-
-- [ ] **Step 5: Generate and validate the migration in an isolated database**
-
-Run: `npx prisma format`  以及 `npm run prisma:validate`
-
-Run against a disposable PostgreSQL database: `npx prisma migrate deploy`
-
-Expected: schema validation succeeds; all new tables, indexes, unique constraints and foreign keys exist; the working database is not the existing LawLink preview or production database.
+Add labels and scopes to `PERMISSIONS`; add the new keys to the explicit `FINANCE` grant set only where the existing role model intends full finance access. Do not add them to `MANAGER_GRANTS`, ordinary lawyer grants or `SOLE_PRACTICE_GRANTS` automatically. Add a separate explicit helper for `finance.adjust` and `finance.rules` checks if the existing `canExecuteFinance` union cannot express them safely.
 
 - [ ] **Step 6: Run focused tests and commit**
 
-Run: `npm run test:run -- src/tests/lib/finance-internal-permissions.test.ts src/tests/lib/permissions.test.ts`
+Run: `npm run test:run -- src/tests/lib/finance-internal-permissions.test.ts src/tests/lib/permissions.test.ts src/tests/lib/custom-roles.test.ts`
+Expected: PASS. Then run: `npm run prisma:validate`.
+Commit:
 
-Expected: PASS.
-
-Commit: `git add prisma src/lib/roles/catalog.ts src/tests/lib/permissions.test.ts src/tests/lib/finance-internal-permissions.test.ts && git commit -m "feat: add internal finance data boundaries"`
-
-## Task 2: 实现纯函数金额规则引擎
-
-**Files:**
-- Create: `src/lib/finance/internal-types.ts`
-- Create: `src/lib/finance/internal-rules.ts`
-- Create: `src/tests/lib/finance-internal-rules.test.ts`
-
-**Interfaces:**
-- Consumes: `FinanceRuleVersion.definition` after Zod validation and confirmed `Payment` snapshots supplied by the server layer。
-- Produces: `validateRuleDefinition()`、`calculateInternalAllocation()`、`assertAllocationInvariant()`。
-
-- [ ] **Step 1: Write failing tests for the approved initial rules**
-
-```ts
-import { describe, expect, it } from "vitest";
-import { Prisma } from "@prisma/client";
-import { calculateInternalAllocation, financeRuleDefinitionSchema } from "@/lib/finance/internal-rules";
-
-const d = (value: string) => new Prisma.Decimal(value);
-
-describe("内部财务分配规则", () => {
-  it("渠道案件按 20/45/35 分成并保持金额守恒", () => {
-    const result = calculateInternalAllocation({
-      sourceId: "payment-1", matterId: "matter-1", grossAmount: d("100000.00"),
-      origin: "CHANNEL", lawyerLevel: null,
-      commissionPlans: [{ userId: "lawyer-1", percent: d("60") }, { userId: "lawyer-2", percent: d("40") }],
-      rule: { channel: { channelPercent: "20", firmPercent: "45", lawyerPoolPercent: "35" }, residualRecipient: "FIRM" }
-    });
-    expect(result.lines.map((line) => [line.kind, line.amount.toFixed(2)])).toEqual([
-      ["CHANNEL_COMMISSION", "20000.00"], ["FIRM_RETAINED", "45000.00"],
-      ["LAWYER_POOL", "35000.00"], ["LAWYER_SHARE", "21000.00"], ["LAWYER_SHARE", "14000.00"]
-    ]);
-    expect(result.totalOutput.toFixed(2)).toBe("100000.00");
-    expect(result.residual.toFixed(2)).toBe("0.00");
-  });
-
-  it("自拓案件按身份取规则比例，不能把比例写死在算法里", () => {
-    const result = calculateInternalAllocation({
-      sourceId: "payment-2", matterId: "matter-2", grossAmount: d("10000.00"),
-      origin: "SELF_SOURCED", lawyerLevel: "INDEPENDENT_LAWYER", commissionPlans: [],
-      rule: { selfSourced: { roleRates: { INDEPENDENT_LAWYER: "17.5" } }, residualRecipient: "FIRM" }
-    });
-    expect(result.lines.find((line) => line.kind === "FIRM_RETAINED")?.amount.toFixed(2)).toBe("1750.00");
-    expect(result.lines.find((line) => line.kind === "NET_DISTRIBUTABLE")?.amount.toFixed(2)).toBe("8250.00");
-  });
-
-  it("拒绝比例超过 100%、缺失身份比例和负金额", () => {
-    expect(() => financeRuleDefinitionSchema.parse({ channel: { channelPercent: "50", firmPercent: "60", lawyerPoolPercent: "0" }, residualRecipient: "FIRM" })).toThrow();
-    expect(() => calculateInternalAllocation({ sourceId: "p", matterId: "m", grossAmount: d("-1"), origin: "CHANNEL", lawyerLevel: null, commissionPlans: [], rule: { channel: { channelPercent: "20", firmPercent: "45", lawyerPoolPercent: "35" }, residualRecipient: "FIRM" } })).toThrow("金额");
-  });
-});
+```powershell
+git add prisma/schema.prisma prisma/migrations/20260922000001_finance_operating_loop/migration.sql src/lib/roles/catalog.ts src/tests/lib/permissions.test.ts src/tests/lib/custom-roles.test.ts src/tests/lib/finance-internal-permissions.test.ts
+git commit -m "feat: add finance operating loop schema and permissions"
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `npm run test:run -- src/tests/lib/finance-internal-rules.test.ts`
-
-Expected: FAIL because the rule module and exported functions do not exist.
-
-- [ ] **Step 3: Define the pure types and versioned rule schema**
-
-`src/lib/finance/internal-types.ts` 至少导出：
-
-```ts
-import { Prisma } from "@prisma/client";
-
-export type DecimalLike = Prisma.Decimal;
-export type AllocationOrigin = "CHANNEL" | "SELF_SOURCED" | "OTHER";
-export type AllocationLineKind =
-  | "CHANNEL_COMMISSION" | "FIRM_RETAINED" | "LAWYER_POOL" | "LAWYER_SHARE"
-  | "ASSISTANCE_SHARE" | "REIMBURSEMENT" | "SOCIAL_INSURANCE" | "TAX_RESERVE"
-  | "NET_DISTRIBUTABLE" | "UNALLOCATED";
-
-export type AllocationInput = {
-  sourceId: string;
-  matterId: string;
-  grossAmount: DecimalLike;
-  origin: AllocationOrigin;
-  lawyerLevel: string | null;
-  commissionPlans: { userId: string; percent: DecimalLike }[];
-  rule: unknown;
-};
-
-export type AllocationLine = {
-  kind: AllocationLineKind;
-  amount: DecimalLike;
-  baseAmount: DecimalLike;
-  beneficiaryUserId?: string;
-  note?: string;
-};
-
-export type AllocationResult = {
-  lines: AllocationLine[];
-  totalInput: DecimalLike;
-  totalOutput: DecimalLike;
-  residual: DecimalLike;
-};
-```
-
-`src/lib/finance/internal-rules.ts` 的 schema 必须约束所有比例为 0—100、最多两位小数；渠道三项合计不超过 100%；自拓身份必须能找到对应比例；`residualRecipient` 只允许 `FIRM` 或 `UNALLOCATED`。
-
-- [ ] **Step 4: Implement Decimal-only allocation and invariant checks**
-
-实现时使用以下算法边界：金额先 `toDecimalPlaces(2)`；比例乘法先保留 Decimal 精度；分配到人时按分向下取整，再按余数降序、`userId` 升序分配尾差；任何分配结果不得为负；`totalOutput + residual === totalInput`。
-
-```ts
-export function calculateInternalAllocation(input: AllocationInput): AllocationResult {
-  const rule = financeRuleDefinitionSchema.parse(input.rule);
-  if (!input.grossAmount.isFinite() || input.grossAmount.lt(0)) throw new ActionError("金额必须为非负数");
-  const gross = input.grossAmount.toDecimalPlaces(2);
-  const lines: AllocationLine[] = [];
-
-  if (input.origin === "CHANNEL") {
-    const channel = rule.channel;
-    if (!channel) throw new ActionError("缺少渠道案件规则");
-    const channelAmount = percentOf(gross, channel.channelPercent);
-    const firmAmount = percentOf(gross, channel.firmPercent);
-    const poolAmount = percentOf(gross, channel.lawyerPoolPercent);
-    lines.push(line("CHANNEL_COMMISSION", channelAmount, gross));
-    lines.push(line("FIRM_RETAINED", firmAmount, gross));
-    lines.push(line("LAWYER_POOL", poolAmount, gross));
-    lines.push(...allocatePool(poolAmount, input.commissionPlans));
-  } else if (input.origin === "SELF_SOURCED") {
-    const rate = rule.selfSourced?.roleRates[input.lawyerLevel ?? ""];
-    if (rate === undefined) throw new ActionError("缺少当前律师身份的自拓案件规则");
-    const firmAmount = percentOf(gross, rate);
-    lines.push(line("FIRM_RETAINED", firmAmount, gross));
-    lines.push(line("NET_DISTRIBUTABLE", gross.minus(firmAmount), gross));
-  } else {
-    lines.push(line("UNALLOCATED", gross, gross, "案件来源待确认"));
-  }
-
-  return finalizeAllocation(lines, gross, rule.residualRecipient);
-}
-```
-
-具体实现必须补齐 `percentOf`、`allocatePool`、`finalizeAllocation` 和 `assertAllocationInvariant`，并让每个函数都返回 Decimal，不得把金额转换成 JavaScript `number`。
-
-- [ ] **Step 5: Run focused tests and commit**
-
-Run: `npm run test:run -- src/tests/lib/finance-internal-rules.test.ts src/tests/lib/finance-allocation.test.ts`
-
-Expected: PASS; existing `finance-allocation` tests remain unchanged and continue通过。
-
-Commit: `git add src/lib/finance/internal-types.ts src/lib/finance/internal-rules.ts src/tests/lib/finance-internal-rules.test.ts && git commit -m "feat: add versioned internal finance rules"`
-
-## Task 3: 实现 CSV/XLS/XLSX 导入与标准化
+### Task 2: Implement CSV/XLS/XLSX parsing, normalization and source fingerprints
 
 **Files:**
 - Modify: `package.json`
 - Modify: `package-lock.json`
+- Modify: `src/lib/finance/internal-types.ts`
 - Create: `src/lib/finance/import-parser.ts`
+- Create: `src/lib/finance/source-fingerprint.ts`
 - Create: `src/tests/lib/finance-import-parser.test.ts`
+- Create: `src/tests/lib/finance-source-fingerprint.test.ts`
 
 **Interfaces:**
-- Consumes: `File` 的字节、导入类型和用户选择的 canonical column mapping。
-- Produces: `readFinanceWorkbook()`、`normalizeFinanceRows()`、`financeImportMappingSchema`，不访问数据库、不写文件。
+- Produces `parseFinanceWorkbook(bytes: Buffer, fileName: string, kind: FinanceSourceKind): FinanceParseResult`.
+- Produces `normalizeFinanceRow(input: unknown, mapping: FinanceColumnMapping): FinanceNormalizedRow | FinanceRowError`.
+- Produces `fileSha256(bytes: Buffer): string` and `rowFingerprint(row: FinanceNormalizedRow): string`.
 
-- [ ] **Step 1: Add the workbook reader dependency**
+- [ ] **Step 1: Add the fixed parser dependency**
 
-Run: `npm install --save-exact xlsx@0.18.5`
+Add `xlsx@0.18.5` at a fixed version compatible with Node 20, using it only for reading `.csv`, `.xls` and `.xlsx`; disable formula evaluation and macro preservation for uploaded files. Keep ExcelJS for generated workbooks. Run `npm install xlsx@0.18.5 --package-lock-only` and verify the lockfile contains no unrelated dependency upgrades.
 
-Expected: `package.json` 和 `package-lock.json` 只增加 `xlsx`，不升级现有依赖；安装后 `npm ls xlsx` 显示 `xlsx@0.18.5`。
+- [ ] **Step 2: Write parser tests for Chinese bank headers and bad rows**
 
-- [ ] **Step 2: Write parser tests for all supported file types**
+In the test file, import `* as XLSX from "xlsx"` and define the local helper `xlsxBuffer(rows)` by creating a workbook, appending `XLSX.utils.aoa_to_sheet(rows)` as `Sheet1`, and returning `Buffer.from(XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }))`; this helper is test-only and does not enter the production parser.
 
 ```ts
-import { describe, expect, it } from "vitest";
-import * as XLSX from "xlsx";
-import { normalizeFinanceRows, readFinanceWorkbook } from "@/lib/finance/import-parser";
+it("识别借方/贷方并统一为有符号金额", () => {
+  const result = parseFinanceWorkbook(xlsxBuffer([["日期", "对方户名", "借方发生额", "贷方发生额", "余额"], ["2026-08-01", "合成客户", "", "100000.00", "100000.00"]]), "银行流水.xlsx", "BANK_STATEMENT");
+  expect(result.rows[0]).toMatchObject({ occurredAt: "2026-08-01", amount: "100000.00", direction: "CREDIT" });
+});
 
-const mapping = {
-  occurredAt: "交易日期", amount: "金额", direction: "收支", counterparty: "对方户名",
-  description: "摘要", accountRef: "流水号"
-} as const;
-
-describe("财务资料导入标准化", () => {
-  it.each(["csv", "xlsx", "xls"] as const)("读取 %s 并统一上海日期与金额", (kind) => {
-    const rows = [["交易日期", "金额", "收支", "对方户名", "摘要", "流水号"], ["2026-08-01", "1,234.50", "收入", "合成客户", "案件收款", "TX-1"]];
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(rows), "流水");
-    const bytes = kind === "csv" ? Buffer.from(XLSX.utils.sheet_to_csv(workbook.Sheets["流水"])) : Buffer.from(XLSX.write(workbook, { type: "buffer", bookType: kind === "xls" ? "biff8" : "xlsx" }));
-    const parsed = readFinanceWorkbook(`sample.${kind}`, bytes);
-    const normalized = normalizeFinanceRows("BANK_STATEMENT", parsed, mapping);
-    expect(normalized.errors).toEqual([]);
-    expect(normalized.rows[0]).toMatchObject({ amount: "1234.50", direction: "IN", externalReference: "TX-1" });
-  });
-
-  it("拒绝缺失金额、非法方向、超大文件和公式结果", () => {
-    expect(() => normalizeFinanceRows("BANK_STATEMENT", { headers: ["金额"], rows: [["-1"]] }, { amount: "金额" })).toThrow();
-    expect(() => readFinanceWorkbook("bad.txt", Buffer.from("x"))).toThrow("仅支持");
-  });
+it("缺少日期或金额时返回行级错误而不是静默丢弃", () => {
+  const result = parseFinanceWorkbook(xlsxBuffer([["摘要", "金额"], ["缺日期", "100.00"]]), "bad.xlsx", "BANK_STATEMENT");
+  expect(result.errors[0]).toMatchObject({ code: "MISSING_OCCURRED_AT", rowNumber: 2 });
 });
 ```
 
-- [ ] **Step 3: Implement bounded workbook reading**
+- [ ] **Step 3: Run parser tests to verify they fail**
 
-`readFinanceWorkbook(fileName, bytes)` 必须：
+Run: `npm run test:run -- src/tests/lib/finance-import-parser.test.ts src/tests/lib/finance-source-fingerprint.test.ts`
+Expected: FAIL because parser and fingerprint functions do not exist.
 
-```ts
-export function readFinanceWorkbook(fileName: string, bytes: Buffer): FinanceWorkbook {
-  if (bytes.byteLength > 20 * 1024 * 1024) throw new ActionError("文件不能超过 20 MB");
-  const ext = path.extname(fileName).toLowerCase();
-  if (ext === ".csv") return parseCsv(bytes);
-  if (ext !== ".xlsx" && ext !== ".xls") throw new ActionError("仅支持 CSV、XLSX 或 XLS 文件");
-  const workbook = XLSX.read(bytes, { type: "buffer", cellFormula: false, cellHTML: false, cellNF: false, dense: true });
-  const sheet = workbook.Sheets[workbook.SheetNames[0]];
-  if (!sheet) throw new ActionError("文件中没有工作表");
-  const rows = XLSX.utils.sheet_to_json<string[]>(sheet, { header: 1, raw: false, defval: "" });
-  if (rows.length < 2 || rows.length > 20000) throw new ActionError("数据行数必须在 1—20000 行之间");
-  return { headers: rows[0].map(String), rows: rows.slice(1).map(row => row.map(value => String(value ?? ""))) };
-}
+- [ ] **Step 4: Implement deterministic parsing and normalization**
+
+Normalize dates to `YYYY-MM-DD`, amounts to decimal strings, direction to `CREDIT`/`DEBIT`, and preserve source file name plus source row number. Detect common Chinese aliases for date, debit, credit, amount, balance, counterparty, account, purpose, abstract, note, receipt number and invoice/reference number. A generic zero amount may be replaced by a non-zero debit/credit observation from the same row; never invent a value when both are absent.
+
+Use a stable serializer that sorts object keys and normalizes whitespace before hashing. `rowFingerprint` must include batch kind, date, signed amount, counterparty digest, external reference, abstract digest and source row, but must not include a complete account number or unredacted sensitive text.
+
+- [ ] **Step 5: Run tests and commit**
+
+Run: `npm run test:run -- src/tests/lib/finance-import-parser.test.ts src/tests/lib/finance-source-fingerprint.test.ts`
+Expected: PASS for `.csv`, `.xls`, `.xlsx`, Chinese headers, negative expenses, duplicate rows and missing-field errors.
+
+```powershell
+git add package.json package-lock.json src/lib/finance/internal-types.ts src/lib/finance/import-parser.ts src/lib/finance/source-fingerprint.ts src/tests/lib/finance-import-parser.test.ts src/tests/lib/finance-source-fingerprint.test.ts
+git commit -m "feat: normalize finance source files"
 ```
 
-CSV 解析不能用 `split(",")`，要处理双引号、换行和 UTF-8 BOM。标准字段为 `occurredAt`、`amount`、`direction`、`counterparty`、`description`、`accountRef`、`externalReference`、`category`；映射中至少要求日期、金额和收支方向。方向只接受“收入/支出/收/付/入/出”及英文 `IN/OUT`。
-
-- [ ] **Step 4: Implement normalization and fingerprints**
-
-`normalizeFinanceRows()` 输出 `{ rows, errors, duplicateFingerprints }`；金额统一为字符串形式的两位小数，日期使用上海日键转成 UTC 边界，指纹由 `kind + occurredAt + amount + direction + accountRef + externalReference + description` 的规范化文本 SHA-256 生成。错误只能使用字段名和错误码，不把完整对方名称或摘要写入异常日志。
-
-- [ ] **Step 5: Run parser tests and commit**
-
-Run: `npm run test:run -- src/tests/lib/finance-import-parser.test.ts`
-
-Expected: PASS for CSV/XLSX/XLS and all malformed-input tests。
-
-Commit: `git add package.json package-lock.json src/lib/finance/import-parser.ts src/tests/lib/finance-import-parser.test.ts && git commit -m "feat: parse internal finance source files"`
-
-## Task 4: 建立导入批次、私有原文件和 Server Actions
+### Task 3: Build atomic import batches and protected source downloads
 
 **Files:**
 - Create: `src/server/finance/internal-schemas.ts`
 - Create: `src/server/finance/internal-imports.ts`
-- Create: `src/server/finance/internal-actions.ts`
-- Create: `src/app/api/finance/imports/[id]/source/route.ts`
+- Create: `src/app/api/finance/internal/imports/preview/route.ts`
+- Create: `src/app/api/finance/internal/imports/commit/route.ts`
+- Create: `src/app/api/finance/internal/imports/[id]/source/route.ts`
 - Create: `src/tests/server/finance-internal-imports.test.ts`
+- Modify: `src/server/audit.ts` only if a finance-specific redaction helper is needed; do not change generic audit semantics.
 
 **Interfaces:**
-- `previewFinanceImport(formData: FormData): Promise<FinanceImportPreview>`：解析并校验，不写数据库，不写存储。
-- `commitFinanceImport(formData: FormData): Promise<{ ok: true; batchId: string }>`：二次解析、哈希去重、写私有文件和事务落库。
-- `listFinanceImportBatches(): Promise<FinanceImportBatchSummary[]>`：只返回财务用户可见的批次元数据。
-- `downloadFinanceImportSource(id: string, userId: string): Promise<{ path: string; mimeType: string; name: string }>`：只返回已经过权限检查的元数据给 Route Handler。
+- `previewFinanceImport(formData: FormData): Promise<FinanceImportPreview>`
+- `commitFinanceImport(input: CommitFinanceImportInput): Promise<{ batchId: string; duplicate: boolean }>`
+- `downloadFinanceImportSource(id: string): Promise<{ bytes: Buffer; fileName: string; mimeType: string }>`
 
-- [ ] **Step 1: Write failing action tests**
+- [ ] **Test fixture setup:** use an in-memory Prisma/storage mock with local test helpers `formDataFor(fileName)` and `inputFor(fileName)` that load only the Task 0 synthetic bytes; assert the action receives the mock through dependency injection rather than connecting to a real database or storage provider.
 
-测试 mock `@/lib/prisma`、`@/lib/storage`、`@/lib/auth/session`、`@/server/audit` 和 `next/cache`，覆盖：
+- [ ] **Step 1: Write failing atomicity tests**
 
 ```ts
-it("预览不产生数据库或存储写入", async () => {
-  const result = await previewFinanceImport(formDataFor("sample.xlsx"));
+it("预览不写数据库和私有存储", async () => {
+  const result = await previewFinanceImport(formDataFor("synthetic.xlsx"));
   expect(result.validCount).toBe(1);
   expect(db.financeImportBatch.create).not.toHaveBeenCalled();
   expect(storage.writeFile).not.toHaveBeenCalled();
 });
 
-it("同一 sha256 的已提交批次幂等返回原 batchId", async () => {
+it("同一 sha256 的已提交批次幂等返回原批次", async () => {
   db.financeImportBatch.findUnique.mockResolvedValue({ id: "batch-old", status: "COMMITTED" });
-  await expect(commitFinanceImport(formDataFor("same.xlsx"))).resolves.toEqual({ ok: true, batchId: "batch-old" });
+  await expect(commitFinanceImport(inputFor("same.xlsx"))).resolves.toEqual({ batchId: "batch-old", duplicate: true });
   expect(storage.writeFile).not.toHaveBeenCalled();
 });
 
-it("事务失败时删除已经写入的原文件", async () => {
+it("数据库事务失败时删除已写入的原文件", async () => {
   db.financeImportBatch.findUnique.mockResolvedValue(null);
   db.$transaction.mockRejectedValue(new Error("db failed"));
-  await expect(commitFinanceImport(formDataFor("sample.xlsx"))).rejects.toThrow("db failed");
+  await expect(commitFinanceImport(inputFor("synthetic.xlsx"))).rejects.toThrow("db failed");
   expect(storage.deleteFile).toHaveBeenCalledOnce();
 });
 ```
@@ -606,62 +338,53 @@ it("事务失败时删除已经写入的原文件", async () => {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `npm run test:run -- src/tests/server/finance-internal-imports.test.ts`
+Expected: FAIL because the schemas, actions and routes do not exist.
 
-Expected: FAIL because the actions and Prisma model accessors do not exist.
+- [ ] **Step 3: Implement schemas and preview**
 
-- [ ] **Step 3: Implement server input schemas and preview**
+`internal-schemas.ts` must export `financeImportKindSchema`, `financeColumnMappingSchema`, `financePeriodSchema`, `commitFinanceImportSchema` and `sourceDownloadSchema`. Preview validates file extension, byte size, mapped required fields and row-level errors, but returns only safe previews with masked accounts and truncated descriptions.
 
-`internal-schemas.ts` 至少导出：
+- [ ] **Step 4: Implement the atomic commit sequence**
 
-```ts
-export const financeImportKindSchema = z.enum(["BANK_STATEMENT", "PAYROLL", "EXTERNAL_STATEMENT"]);
-export const financeImportMappingSchema = z.record(z.enum([
-  "occurredAt", "amount", "direction", "counterparty", "description", "accountRef", "externalReference", "category"
-]), z.string().min(1));
-export const commitFinanceImportSchema = z.object({
-  kind: financeImportKindSchema,
-  mapping: financeImportMappingSchema,
-  periodStart: z.coerce.date().optional(),
-  periodEnd: z.coerce.date().optional()
-});
-```
+The only accepted sequence is: read bytes → parse and validate again on the server → calculate SHA-256 → look up a committed batch with the same hash and kind → `storage.writeFile("finance-imports", bytes)` → one Prisma transaction creates batch, source file, source rows and audit entry via `auditTx` → return batch ID. If any database step fails after storage succeeds, call `storage.deleteFile` and rethrow the original database error. A batch with blocking row errors is rejected as a whole; it never becomes a partially committed batch.
 
-`previewFinanceImport` 用 `requireSession("finance.import")`，读取 `File`、解析工作簿、执行标准化和数据库中的 fingerprint 查询；返回列名、可映射字段、逐行错误码、总数、有效数和重复数。预览结果不能返回完整原始行，只返回必要的字段值和行号。
+- [ ] **Step 5: Implement protected source download**
 
-- [ ] **Step 4: Implement atomic commit and private storage**
-
-提交顺序固定为：读字节 → 解析并二次校验 → 计算 SHA-256 → 查询已提交同 hash → `storage.writeFile("finance-imports", bytes)` → Prisma transaction 创建 batch/rows → 审计。`storage.writeFile` 成功后任何数据库失败都必须调用 `storage.deleteFile(path)`；删除失败只记录无 PII 的错误代码并继续抛出原数据库异常。
-
-批次只有在所有行有效或明确标记为已存在重复时才能进入 `COMMITTED`；含有字段错误的提交直接拒绝，不创建部分有效的正式批次。批次写入的 `counterparty` 和 `description` 仅供财务域权限用户查看。
-
-- [ ] **Step 5: Implement protected source download route**
-
-`route.ts` 用 `getServerSession(authOptions)` 校验登录，再用 `customOrLegacy(session.user, "finance.read", ...)` 或 `finance.import` 通过后读取批次。响应头使用 `Content-Disposition: attachment`，不得返回公开 URL；审计只写 batch id、文件类型和字节数。
+The route must call `requireSession("finance.read")` or `requireSession("finance.import")`, verify the batch is visible to the session, call `auditStrict` for the sensitive download, set `Content-Disposition: attachment`, and stream bytes without returning a public URL. Audit detail contains batch ID, kind, byte count and file extension only.
 
 - [ ] **Step 6: Run tests and commit**
 
-Run: `npm run test:run -- src/tests/server/finance-internal-imports.test.ts`
+Run: `npm run test:run -- src/tests/server/finance-internal-imports.test.ts`; expected PASS for preview side effects, duplicate idempotency, transaction cleanup, permission rejection, masked preview and protected download.
 
-Expected: PASS;预览无副作用、重复导入幂等、数据库失败可清理原文件。
+```powershell
+git add src/server/finance/internal-schemas.ts src/server/finance/internal-imports.ts src/app/api/finance/internal/imports src/tests/server/finance-internal-imports.test.ts
+git commit -m "feat: add audited finance import batches"
+```
 
-Commit: `git add src/server/finance/internal-schemas.ts src/server/finance/internal-imports.ts src/server/finance/internal-actions.ts src/app/api/finance/imports src/tests/server/finance-internal-imports.test.ts && git commit -m "feat: add audited finance import batches"`
-
-## Task 5: 实现确定性收款勾稽与差异工作流
+### Task 4: Implement deterministic reconciliation, claims and refunds
 
 **Files:**
 - Create: `src/lib/finance/internal-matching.ts`
-- Create: `src/tests/lib/finance-internal-matching.test.ts`
 - Create: `src/server/finance/internal-reconciliation.ts`
-- Modify: `src/server/finance/internal-actions.ts`
+- Create: `src/app/api/finance/internal/reconciliation/route.ts`
+- Create: `src/app/api/finance/internal/reconciliation/[id]/decision/route.ts`
+- Create: `src/app/api/finance/internal/reconciliation/export/route.ts`
+- Create: `src/app/api/finance/internal/reconciliation/import/route.ts`
+- Create: `src/tests/lib/finance-internal-matching.test.ts`
 - Create: `src/tests/server/finance-internal-reconciliation.test.ts`
+- Modify: `src/lib/finance/internal-types.ts` only for matching DTOs.
 
 **Interfaces:**
-- `rankPaymentCandidates(row, candidates): MatchSuggestion[]`：纯函数，返回分数、理由和是否允许自动建议。
-- `suggestFinanceMatches(batchId): Promise<{ caseCount: number; suggestedCount: number }>`。
-- `confirmFinanceMatch(input): Promise<{ ok: true; caseId: string }>`。
-- `resolveFinanceException(input): Promise<{ ok: true }>`。
+- `rankPaymentCandidates(row: FinanceNormalizedRow, candidates: ConfirmedPaymentCandidate[]): FinanceMatchSuggestion[]`
+- `listFinanceReconciliationCases(input: ReconciliationQuery): Promise<ReconciliationQueue>`
+- `decideFinanceReconciliation(input: ReconciliationDecisionInput): Promise<{ caseId: string; status: FinanceMatchStatus }>`
+- `linkFinanceRefund(input: RefundLinkInput): Promise<{ linkId: string }>`
+- `exportClaimDecisions(input: ReconciliationQuery): Promise<Buffer>`
+- `importClaimDecisions(file: File): Promise<{ applied: number; skipped: number; errors: number }>`
 
 - [ ] **Step 1: Write matching tests before implementation**
+
+In the test file, define test-only helpers `row(date, amount): FinanceNormalizedRow` and `payment(id, date, amount): ConfirmedPaymentCandidate` with the fields required by the declared interfaces; use no database records or production identifiers.
 
 ```ts
 it("同金额同上海日期优先于仅金额相同的候选", () => {
@@ -672,97 +395,107 @@ it("同金额同上海日期优先于仅金额相同的候选", () => {
   expect(result[0]).toMatchObject({ paymentId: "p-same-day", confidence: "HIGH" });
 });
 
-it("同分候选不自动建议，进入 EXCEPTION", () => {
+it("同分候选进入疑点而不是自动确认", () => {
   const result = rankPaymentCandidates(row("2026-08-01", "100.00"), [
     payment("p-1", "2026-08-01", "100.00"), payment("p-2", "2026-08-01", "100.00")
   ]);
-  expect(result.every((item) => item.autoConfirm === false)).toBe(true);
+  expect(result.every(item => item.autoConfirm === false)).toBe(true);
 });
 
-it("金额不同即使摘要相同也不能自动匹配", () => {
+it("金额不同即使摘要相同也不产生自动候选", () => {
   expect(rankPaymentCandidates(row("2026-08-01", "100.01"), [payment("p", "2026-08-01", "100.00")])).toEqual([]);
 });
 ```
 
-- [ ] **Step 2: Implement deterministic candidate ranking**
+- [ ] **Step 2: Implement scoring rules**
 
-候选规则固定为：金额精确相等且流水号/发票引用相同为 100 分；金额相等且同上海自然日为 90 分；金额相等且 ±3 上海自然日为 70 分；其余不产生候选。最高分唯一且至少 90 分才是 `SUGGESTED`，同分或目标已被其他已确认案例占用则是 `EXCEPTION`。不做模糊金额匹配，不根据客户姓名单独确认。
+Use exact amount plus same external reference/invoice reference for 100 points; exact amount plus same Shanghai calendar day for 90; exact amount within ±3 Shanghai calendar days for 70; otherwise no candidate. Only a unique candidate scoring at least 90 can be `SUGGESTED`. Same-score candidates, an already-used Payment, an unconfirmed Payment or a non-`LAWYER_FEE` Payment must be `EXCEPTION` or omitted. Never confirm based on client name alone.
 
-- [ ] **Step 3: Implement server query and transactional decisions**
+- [ ] **Step 3: Implement server queries and decisions**
 
-候选只查询 `Payment` 的来源 `FeeEntry.confirmState = CONFIRMED`，并按 `Payment.moneyKind = LAWYER_FEE` 与财务可见范围过滤；不读取待确认收款。`confirmFinanceMatch` 使用 `finance.reconcile`，事务内检查案例仍为 `SUGGESTED/EXCEPTION`、目标未被其他案例占用，然后更新状态、审核人、审核时间和理由，不修改 `Payment`、`Receivable` 或原始流水金额。
+Candidate queries must join only `Payment` whose source `FeeEntry.confirmState = CONFIRMED`, `moneyKind = LAWYER_FEE`, `matter.deletedAt = null` and whose matter is visible under the finance report filter. The decision transaction locks the case, checks that it is still open, checks that the Payment is not already confirmed elsewhere, writes the decision and `auditTx`, and never edits source row amount or Payment amount.
 
-`resolveFinanceException` 必须要求非空理由；`IGNORE` 和关闭差异都要写审计；重复请求使用 `where: { id, status: { in: [...] } }` 防止并发二次确认。
+- [ ] **Step 4: Implement unresolved claims and refund links**
 
-- [ ] **Step 4: Run tests and commit**
+Support claim target `clientId`, `matterId`, optional lawyer/channel metadata, reason and operator. A debit containing refund/return/advance semantics may be linked to one original lawyer-fee Payment; the net amount is used by later calculations. Reject a second active refund link for the same source amount unless a finance correction explicitly reverses the first link.
 
-Run: `npm run test:run -- src/tests/lib/finance-internal-matching.test.ts src/tests/server/finance-internal-reconciliation.test.ts`
-
-Expected: PASS;待确认实收不会出现在候选中，歧义候选不会自动确认。
-
-Commit: `git add src/lib/finance/internal-matching.ts src/tests/lib/finance-internal-matching.test.ts src/server/finance/internal-reconciliation.ts src/server/finance/internal-actions.ts src/tests/server/finance-internal-reconciliation.test.ts && git commit -m "feat: add finance reconciliation workflow"`
-
-## Task 6: 实现规则版本、案件来源档案和分配快照
-
-**Files:**
-- Create: `src/server/finance/internal-rules-actions.ts`
-- Create: `src/server/finance/internal-allocation.ts`
-- Create: `src/tests/server/finance-internal-rules.test.ts`
-- Create: `src/tests/server/finance-internal-allocation.test.ts`
-- Modify: `src/server/finance/internal-actions.ts`
-
-**Interfaces:**
-- `createFinanceRuleVersion(input): Promise<{ id: string; version: number }>`。
-- `updateFinanceRuleVersion(id: string, input): Promise<{ ok: true }>`：仅允许更新 `DRAFT` 版本。
-- `publishFinanceRuleVersion(id): Promise<{ ok: true }>`。
-- `setFinanceMatterProfile(input): Promise<{ ok: true }>`。
-- `previewInternalAllocation(input): Promise<AllocationPreview>`。
-- `commitInternalAllocation(runId): Promise<{ ok: true; runId: string }>`。
-
-- [ ] **Step 1: Write versioning and allocation tests**
-
-```ts
-it("已发布规则不能原地编辑，重叠生效期不能发布", async () => {
-  db.financeRuleVersion.findFirst.mockResolvedValue({ id: "v1", status: "PUBLISHED", effectiveFrom: new Date("2026-01-01"), effectiveTo: null });
-  await expect(publishFinanceRuleVersion("v2")).rejects.toThrow("生效期重叠");
-  await expect(updateFinanceRuleVersion("v1", { effectiveTo: new Date("2026-12-31") })).rejects.toThrow("已发布规则不可修改");
-});
-
-it("缺少案件来源档案或律师分成方案时只允许预览，不允许提交", async () => {
-  const preview = await previewInternalAllocation({ periodStart: start, periodEnd: end });
-  expect(preview.blockingIssues).toEqual(expect.arrayContaining(["MISSING_MATTER_PROFILE", "MISSING_COMMISSION_PLAN"]));
-  await expect(commitInternalAllocation("run-preview")).rejects.toThrow("存在未解决配置");
-});
-
-it("同一期间和来源快照重复提交是幂等的", async () => {
-  db.financeAllocationRun.findFirst.mockResolvedValue({ id: "run-existing", status: "COMMITTED" });
-  await expect(commitInternalAllocation("run-new")).resolves.toEqual({ ok: true, runId: "run-existing" });
-});
-```
-
-- [ ] **Step 2: Implement rule CRUD with immutable published versions**
-
-所有动作先 `requireSession("finance.rules")`，规则定义交给 `financeRuleDefinitionSchema`；新版本号按 rule set 内最大版本加一。发布前在同一事务中检查：规则集 active、`effectiveFrom < effectiveTo`、同一 rule kind 的 published 版本生效区间不重叠、比例和身份配置完整。发布写 `publishedById/publishedAt` 和审计，已经发布的行不提供 update/delete 动作。
-
-- [ ] **Step 3: Implement matter origin profile actions**
-
-`setFinanceMatterProfile` 使用 `finance.rules`，只保存 `matterId`、`origin`、`lawyerLevel`、可选 `channelLabel` 和内部说明；先确认案件存在且未删除，再使用 `upsert`。改变来源档案必须写审计；案件正文和客户字段不复制到财务表。
-
-- [ ] **Step 4: Implement allocation preview and commit**
-
-读取指定上海账期内的已确认 `Payment`，通过 `sourceEntry` 反查 `FeeEntry` 和 `Billing`，限定 `moneyKind = LAWYER_FEE`。对每笔收款加载 `FinanceMatterProfile`、有效规则版本和 active `CommissionPlan`，调用 Task 2 的纯函数。
-
-预览创建 `FinanceAllocationRun(status=PREVIEW)` 和行快照；缺少案件档案、规则、分成方案或存在非法比例时记录 blocking issue，不能直接标记 `COMMITTED`。提交时用事务锁定 preview run，重新读取来源并重新计算，只有输入摘要未变化、没有 blocking issue 且 run 仍为 `PREVIEW` 才写入行并改为 `COMMITTED`。计算结果只追加，不改 `Payment` 或 `FeeEntry`。
+The export route contains only masked source row ID, date, signed amount, candidate IDs, decision column and a short reason field. The import route validates the batch ID and row fingerprint again, ignores already decided rows, applies only explicit `CONFIRM`, `IGNORE` or `SUSPECT` decisions, and returns row-level errors without changing the original source row.
 
 - [ ] **Step 5: Run tests and commit**
 
-Run: `npm run test:run -- src/tests/server/finance-internal-rules.test.ts src/tests/server/finance-internal-allocation.test.ts src/tests/lib/finance-internal-rules.test.ts`
+Run: `npm run test:run -- src/tests/lib/finance-internal-matching.test.ts src/tests/server/finance-internal-reconciliation.test.ts`
+Expected: PASS; pending receipts never become candidates, ambiguous matches never auto-confirm, repeated decisions are idempotent, and refund links preserve source history.
 
-Expected: PASS;规则不可变、缺配置阻断提交、重试幂等、历史快照不随新规则变化。
+```powershell
+git add src/lib/finance/internal-matching.ts src/server/finance/internal-reconciliation.ts src/app/api/finance/internal/reconciliation src/tests/lib/finance-internal-matching.test.ts src/tests/server/finance-internal-reconciliation.test.ts
+git commit -m "feat: add finance reconciliation and claim workflow"
+```
 
-Commit: `git add src/server/finance/internal-rules-actions.ts src/server/finance/internal-allocation.ts src/server/finance/internal-actions.ts src/tests/server/finance-internal-rules.test.ts src/tests/server/finance-internal-allocation.test.ts && git commit -m "feat: persist internal finance allocation snapshots"`
+## 阶段 2：版本化分配与三视角核对
 
-## Task 7: 实现核对报表与 Excel 导出
+### Task 5: Implement matter profiles, versioned rules and allocation snapshots
+
+**Files:**
+- Create: `src/lib/finance/internal-rules.ts`
+- Create: `src/server/finance/internal-rules.ts`
+- Create: `src/server/finance/internal-allocation.ts`
+- Create: `src/app/api/finance/internal/rules/route.ts`
+- Create: `src/app/api/finance/internal/rules/[id]/publish/route.ts`
+- Create: `src/app/api/finance/internal/allocation/preview/route.ts`
+- Create: `src/app/api/finance/internal/allocation/commit/route.ts`
+- Create: `src/tests/lib/finance-internal-rules.test.ts`
+- Create: `src/tests/server/finance-internal-rules.test.ts`
+- Create: `src/tests/server/finance-internal-allocation.test.ts`
+
+**Interfaces:**
+- `financeRuleDefinitionSchema` and `financeMatterProfileSchema`.
+- `calculateAllocation(input: AllocationInput): AllocationResult`.
+- `createFinanceRuleDraft(input): Promise<{ id: string; version: number }>`.
+- `publishFinanceRule(id: string): Promise<{ id: string; version: number }>`.
+- `setFinanceMatterProfile(input): Promise<{ matterId: string }>`.
+- `previewInternalAllocation(input): Promise<AllocationPreview>`.
+- `commitInternalAllocation(runId: string): Promise<{ runId: string; status: "COMMITTED" }>`.
+
+- [ ] **Step 1: Write pure rule tests**
+
+```ts
+it("渠道案按渠道、律所、案源、承办和协办拆分且金额守恒", () => {
+  const result = calculateAllocation({
+    gross: "100000.00", channelRate: "0.10", firmRate: "0.45",
+    sourceRate: "0.20", handlingRate: "0.45", coRate: "0.35"
+  });
+  expect(result.channel.plus(result.firm).plus(result.source).plus(result.handling).plus(result.co).toFixed(2)).toBe("100000.00");
+  expect(result.channel.gte(0)).toBe(true);
+});
+
+it("缺少案件来源或比例超过边界时阻断提交", () => {
+  expect(() => calculateAllocation({ gross: "100.00", channelRate: "0.10", firmRate: "0.95", sourceRate: "0.50", handlingRate: "0.50", coRate: "0.50" })).toThrow("分配比例不合法");
+});
+```
+
+- [ ] **Step 2: Implement rule schema and immutable publication**
+
+Rules contain kind, effective dates, percentages/fixed amounts, rounding mode, source note and active status. Drafts may be edited; published versions cannot be updated or deleted. Publishing runs in a transaction that checks `effectiveFrom < effectiveTo`, same-kind published ranges do not overlap, percentages are non-negative and totals fit the configured boundary. The publication audit stores rule ID/version and operator, not client names or source descriptions.
+
+- [ ] **Step 3: Implement matter profile and calculation preview**
+
+`setFinanceMatterProfile` upserts only `matterId`, origin, lawyer level, channel label, participant IDs, internal note and audit fields. It verifies the matter exists and is not deleted. Allocation preview reads confirmed `Payment`, `FinanceMatterProfile`, active `CommissionPlan`, refund links and effective rule versions; it reports missing profile, missing plan, missing rule and illegal percentage as blocking issues.
+
+- [ ] **Step 4: Implement immutable commit and idempotency**
+
+Preview creates `FinanceCalculationRun(status = PREVIEW)` and line snapshots. Commit re-reads the sources in a transaction, compares the input fingerprint, refuses changed or blocked input, writes `FinanceAllocationLine`, marks the run `COMMITTED`, and returns the existing committed run for an identical retry. It never edits `Payment`, `FeeEntry` or the matter itself.
+
+- [ ] **Step 5: Run tests and commit**
+
+Run: `npm run test:run -- src/tests/lib/finance-internal-rules.test.ts src/tests/server/finance-internal-rules.test.ts src/tests/server/finance-internal-allocation.test.ts`
+Expected: PASS for immutable publication, percentage boundaries, missing configuration blocks, amount conservation, source-change rejection and idempotent commit.
+
+```powershell
+git add src/lib/finance/internal-rules.ts src/server/finance/internal-rules.ts src/server/finance/internal-allocation.ts src/app/api/finance/internal/rules src/app/api/finance/internal/allocation src/tests/lib/finance-internal-rules.test.ts src/tests/server/finance-internal-rules.test.ts src/tests/server/finance-internal-allocation.test.ts
+git commit -m "feat: persist versioned finance allocation snapshots"
+```
+
+### Task 6: Implement the three finance views and export data contract
 
 **Files:**
 - Create: `src/server/finance/internal-reports.ts`
@@ -771,64 +504,204 @@ Commit: `git add src/server/finance/internal-rules-actions.ts src/server/finance
 - Create: `src/tests/server/finance-internal-reports.test.ts`
 
 **Interfaces:**
-- `getInternalFinanceSummary(input): Promise<InternalFinanceSummary>`。
-- `getReconciliationQueue(input): Promise<ReconciliationQueue>`。
-- `buildInternalFinanceWorkbook(input): Promise<Buffer>`。
+- `getInternalFinanceSummary(input): Promise<InternalFinanceSummary>`.
+- `getPersonView(input): Promise<PersonFinanceView[]>`.
+- `getProjectAttributionView(input): Promise<ProjectAttributionView[]>`.
+- `getFirmOperatingView(input): Promise<FirmOperatingView>`.
+- `buildFinanceWorkbook(input): Promise<Buffer>`.
 
 - [ ] **Step 1: Write aggregation tests**
 
+Use the synthetic fixture helpers from Task 0; define `start` and `end` as fixed `Date` values and provide mocked `committedRun({ amount })`/`previewRun({ amount })` rows matching the Prisma DTO returned by the repository mock. The test must not depend on the real database.
+
 ```ts
-it("按案件、律师、月份汇总时只统计 COMMITTED 快照", async () => {
-  db.financeAllocationRun.findMany.mockResolvedValue([
-    committedRunWithLines({ month: "2026-08", amount: "100.00" }),
-    previewRunWithLines({ month: "2026-08", amount: "999.00" })
+it("只汇总 COMMITTED 计算批次", async () => {
+  db.financeCalculationRun.findMany.mockResolvedValue([
+    committedRun({ amount: "100.00" }),
+    previewRun({ amount: "999.00" })
   ]);
   const result = await getInternalFinanceSummary({ start, end, groupBy: "LAWYER" });
   expect(result.total).toBe("100.00");
 });
 
-it("财务导出权限不足时不生成工作簿", async () => {
-  session.user.role = "LAWYER";
-  await expect(buildInternalFinanceWorkbook({ start, end })).rejects.toThrow("无权");
+it("三视角使用同一计算批次并可穿透到分配行", async () => {
+  const result = await getInternalFinanceSummary({ start, end, groupBy: "ALL" });
+  expect(result.persons[0].calculationRunId).toBe(result.firm.calculationRunId);
+  expect(result.projects[0].lines[0].sourcePaymentId).toBe("synthetic-payment-1");
 });
 ```
 
-- [ ] **Step 2: Implement report queries**
+- [ ] **Step 2: Implement server-side aggregation**
 
-所有查询只接受 `start/end`、`matterId?`、`userId?`、`kind?` 等 Zod 参数；只读取 `FinanceAllocationRun.status = COMMITTED`、`FinanceReconciliationCase.status != IGNORED` 和 `FinanceImportBatch.status = COMMITTED`。输出按案件、律师、渠道、月份和差异状态聚合，金额用 Decimal 字符串返回给页面。
+All query inputs are validated by Zod and filtered by `finance.read`, existing matter visibility and `FinanceCalculationRun.status = COMMITTED`. Person view includes gross income, channel fee, source/handling/co shares, base salary, personal social/fund, custom cost, tax, frozen amount, withdrawn and pending. Project view includes matter, client reference, channel, rates and monthly role amounts. Firm view includes fee revenue, other operating income, channel/lawyer commission, taxes, firm salary/social, rent/office cost, operating result and capital net separately.
 
-- [ ] **Step 3: Implement Excel workbook and protected route**
+- [ ] **Step 3: Implement the workbook contract**
 
-工作簿固定包含“导入批次”“银行流水勾稽”“案件分配”“律师结算”“外部账表差异”五个 sheet。第一行写中文表头，金额列使用 `#,##0.00`，日期使用 `shDayKey`，不把原始完整银行账号写入导出。Route Handler 使用 `finance.export`，审计记录期间、筛选条件、字节数和当前用户，不记录客户名称或摘要全文。
+The workbook has fixed sheets `人员透支表`, `客户项目归属`, `律所经营成果`, `来源与对账`, `调整审计`. Amounts use `#,##0.00`; dates use Shanghai calendar formatting; source files and account fields are masked; each sheet includes `calculationRunId` and source period. The route writes an export audit entry containing period, view, bytes and operator only.
 
 - [ ] **Step 4: Run tests and commit**
 
 Run: `npm run test:run -- src/tests/server/finance-internal-reports.test.ts`
+Expected: PASS; PREVIEW/FAILED runs never appear, unauthorized users are rejected, three views reconcile to the same run and workbook sheet names are stable.
 
-Expected: PASS;预览/失败批次不进入结果，导出无权拒绝，工作簿 sheet 与中文表头固定。
+```powershell
+git add src/server/finance/internal-reports.ts src/server/finance/internal-export.ts src/app/api/finance/internal/export src/tests/server/finance-internal-reports.test.ts
+git commit -m "feat: add finance three-view reports"
+```
 
-Commit: `git add src/server/finance/internal-reports.ts src/server/finance/internal-export.ts src/app/api/finance/internal/export src/tests/server/finance-internal-reports.test.ts && git commit -m "feat: export internal finance reconciliation reports"`
+## 阶段 3：个人内账、工资、税款与投资人经营
 
-## Task 8: 增加财务域页面和现有财务入口
+### Task 7: Implement personal double balances and operating accounting
 
 **Files:**
-- Create: `src/app/(app)/finance/_components/internal-finance-links.tsx`
-- Create: `src/app/(app)/finance/imports/page.tsx`
-- Create: `src/app/(app)/finance/imports/_components/import-workspace.tsx`
-- Create: `src/app/(app)/finance/firm-reconciliation/page.tsx`
-- Create: `src/app/(app)/finance/firm-reconciliation/_components/firm-reconciliation-workspace.tsx`
-- Create: `src/app/(app)/finance/rules/page.tsx`
-- Create: `src/app/(app)/finance/rules/_components/rules-workspace.tsx`
-- Create: `src/app/(app)/finance/internal-ledger/page.tsx`
-- Create: `src/app/(app)/finance/internal-ledger/_components/internal-ledger-workspace.tsx`
+- Create: `src/lib/finance/internal-accounting.ts`
+- Create: `src/server/finance/internal-accounting-actions.ts`
+- Create: `src/app/api/finance/internal/accounting/route.ts`
+- Create: `src/app/api/finance/internal/payroll/route.ts`
+- Create: `src/app/api/finance/internal/tax/route.ts`
+- Create: `src/app/api/finance/internal/capital/route.ts`
+- Create: `src/tests/lib/finance-internal-accounting.test.ts`
+- Create: `src/tests/server/finance-internal-accounting.test.ts`
+
+**Interfaces:**
+- `buildPersonalDoubleBalance(input): PersonalDoubleBalance`.
+- `buildFirmOperatingResult(input): FirmOperatingResult`.
+- `savePayrollFact(input): Promise<{ id: string }>`.
+- `savePartnerTaxRecord(input): Promise<{ id: string }>`.
+- `saveCapitalFlow(input): Promise<{ id: string }>`.
+- `getInternalAccounting(input): Promise<InternalAccountingView>`.
+
+- [ ] **Step 1: Write the double-balance tests**
+
+```ts
+it("收入余额与自担预存余额分开计算", () => {
+  const result = buildPersonalDoubleBalance({
+    openingDistributable: "0.00", openingReserve: "20000.00",
+    earnedIncome: "10000.00", selfCostDue: "30000.00",
+    selfFundingIn: "0.00", withdrawn: "0.00", partnerTaxAdvance: "0.00", unsettledHold: "0.00"
+  });
+  expect(result.selfFundingUsed).toBe("20000.00");
+  expect(result.selfFundingReserveEnd).toBe("0.00");
+  expect(result.reserveGap).toBe("40000.00");
+  expect(result.distributableEnd).toBe("-20000.00");
+});
+
+it("收入提取和个人税款预付不重复进入律所经营成本", () => {
+  const result = buildFirmOperatingResult({ feeRevenue: "100.00", incomeWithdrawal: "80.00", partnerTaxAdvance: "20.00", firmSalary: "0.00", firmSocial: "0.00", rent: "0.00", channel: "0.00", lawyer: "0.00", taxes: "0.00" });
+  expect(result.operatingResult).toBe("100.00");
+});
+```
+
+- [ ] **Step 2: Implement monthly double-balance arithmetic**
+
+For each person and month, calculate earned source/handling/co income, self salary/social/fund cost, self-funding inflow, self-funding used, reserve ending balance, two-month coverage target, reserve gap, unsettled hold, income withdrawal, partner tax advance, personally paid tax and distributable ending balance. Keep negative distributable balances and carry reserve gap to the next month; never clamp a deficit to zero except for a display-only pending-withdrawal field.
+
+- [ ] **Step 3: Implement operating result and capital separation**
+
+Compute `feeRevenue + otherOperatingIncome - channelCommissionAccrued - lawyerCommissionAccrued - turnoverTaxes - firmSalaryCost - firmSocialCost - rentOfficeOther`. Exclude personal reserve, income withdrawal, partner personal tax cash and capital in/out. Record capital flow kind, investor, date, amount, through-partner ID, linked bank source and remarks.
+
+- [ ] **Step 4: Implement payroll and partner tax facts**
+
+Payroll facts contain period, gross salary, commission, social personal/company, fund personal/company, income tax, other deduction, reimbursement, actual payment period and source batch. Partner tax records separate estimated tax, firm advance, personal paid amount/date, phase and evidence reference. All writes require `finance.adjust` or a dedicated finance role and use `auditTx`.
+
+- [ ] **Step 5: Run tests and commit**
+
+Run: `npm run test:run -- src/tests/lib/finance-internal-accounting.test.ts src/tests/server/finance-internal-accounting.test.ts`
+Expected: PASS for two balances, two-month gap carry, income-withdrawal exclusion, tax advance/unverified tax and capital separation.
+
+```powershell
+git add src/lib/finance/internal-accounting.ts src/server/finance/internal-accounting-actions.ts src/app/api/finance/internal/accounting src/app/api/finance/internal/payroll src/app/api/finance/internal/tax src/app/api/finance/internal/capital src/tests/lib/finance-internal-accounting.test.ts src/tests/server/finance-internal-accounting.test.ts
+git commit -m "feat: add personal double balances and firm operating accounting"
+```
+
+## 阶段 4：持久化计算、月结和交付
+
+### Task 8: Implement materialization, adjustments and monthly close package
+
+**Files:**
+- Create: `src/server/finance/materialization.ts`
+- Create: `src/server/finance/monthly-close.ts`
+- Create: `src/app/api/finance/internal/materialize/route.ts`
+- Create: `src/app/api/finance/internal/monthly-close/route.ts`
+- Create: `src/app/api/finance/internal/adjustments/route.ts`
+- Create: `src/app/api/finance/internal/adjustments/[id]/reverse/route.ts`
+- Create: `src/app/api/finance/internal/artifacts/[id]/route.ts`
+- Create: `src/tests/server/finance-monthly-close.test.ts`
+
+**Interfaces:**
+- `sourceFingerprintForPeriod(period): Promise<string>`.
+- `materializeFinancePeriod(input): Promise<FinanceCalculationRun>`.
+- `getMonthlyCloseStatus(period): Promise<MonthlyCloseStatus>`.
+- `createFinanceAdjustment(input): Promise<{ id: string; runId: string }>`.
+- `reverseFinanceAdjustment(id: string, note: string): Promise<{ reversalId: string }>`.
+- `generateMonthlyClose(period): Promise<FinanceArtifact[]>`.
+
+- [ ] **Test fixture setup:** provide the mocked transaction database as `db` through the service dependency fixture; all dates, users, IDs and source facts come from Task 0 synthetic data.
+
+- [ ] **Step 1: Write monthly close blocking tests**
+
+```ts
+it("待认领或分成不平时不能生成正式月结包", async () => {
+  const status = await getMonthlyCloseStatus("2026-08");
+  expect(status.ready).toBe(false);
+  expect(status.blockingWarnings).toEqual(expect.arrayContaining([expect.stringContaining("待认领")]))
+  await expect(generateMonthlyClose("2026-08")).rejects.toThrow("存在阻断项");
+});
+
+it("调整采用追加凭证，冲销不删除原记录", async () => {
+  const created = await createFinanceAdjustment({ period: "2026-08", account: "user.self_cost", targetUserId: "synthetic-user-1", amount: "100.00", reason: "合成测试调整" });
+  const reversal = await reverseFinanceAdjustment(created.id, "合成测试冲销");
+  expect(await db.financeAdjustment.findUnique({ where: { id: created.id } })).toMatchObject({ status: "REVERSED" });
+  expect(reversal.reversalId).toBeTruthy();
+});
+```
+
+- [ ] **Step 2: Implement source hash and persisted runs**
+
+Hash the sorted, redacted input facts for the selected period and all prior facts that affect carry-forward balances: users and cost settings, matter profiles, confirmed payments, refund links, payroll facts, partner tax records, capital flows and posted/reversed adjustments. If an existing `COMMITTED` run has the same hash, return it. If the hash differs, create a new run and mark the previous one `SUPERSEDED` only after the new run commits.
+
+- [ ] **Step 3: Implement monthly status and adjustment lifecycle**
+
+Status must report archived source files, source kinds, transaction count, unresolved count, unresolved income count, split error count, missing payroll facts, template warnings, blocking warnings, review warnings, run ID and source hash. Adjustments are append-only; a reversal creates an equal opposite row and retains `reversalOfId`. Original bank rows, payroll facts and allocation lines are never edited.
+
+- [ ] **Step 4: Implement generated artifacts**
+
+Generate a wage workbook, accountant package, personal finance views, adjustment audit workbook and complete ZIP from the same committed run. Store artifact metadata and a protected download path. Reject generation when the run is PREVIEW, FAILED or has blocking warnings; allow a clearly labeled draft only through an explicit preview endpoint.
+
+- [ ] **Step 5: Run tests and commit**
+
+Run: `npm run test:run -- src/tests/server/finance-monthly-close.test.ts`
+Expected: PASS for source-hash reuse, changed-source new run, blocking warnings, append-only adjustments, reversals, artifact/run identity and protected downloads.
+
+```powershell
+git add src/server/finance/materialization.ts src/server/finance/monthly-close.ts src/app/api/finance/internal/materialize src/app/api/finance/internal/monthly-close src/app/api/finance/internal/adjustments src/app/api/finance/internal/artifacts src/tests/server/finance-monthly-close.test.ts
+git commit -m "feat: add persisted monthly close and finance artifacts"
+```
+
+### Task 9: Add the six workspaces without changing the existing case-ledger semantics
+
+**Files:**
+- Create: `src/app/(app)/finance/internal/page.tsx`
+- Create: `src/app/(app)/finance/internal/_components/internal-finance-nav.tsx`
+- Create: `src/app/(app)/finance/internal/imports/page.tsx`
+- Create: `src/app/(app)/finance/internal/reconciliation/page.tsx`
+- Create: `src/app/(app)/finance/internal/ledger/page.tsx`
+- Create: `src/app/(app)/finance/internal/rules/page.tsx`
+- Create: `src/app/(app)/finance/internal/monthly-close/page.tsx`
+- Create: `src/app/(app)/finance/internal/_components/import-workspace.tsx`
+- Create: `src/app/(app)/finance/internal/_components/reconciliation-workspace.tsx`
+- Create: `src/app/(app)/finance/internal/_components/ledger-workspace.tsx`
+- Create: `src/app/(app)/finance/internal/_components/rules-workspace.tsx`
+- Create: `src/app/(app)/finance/internal/_components/monthly-close-workspace.tsx`
 - Modify: `src/app/(app)/finance/page.tsx`
+- Modify: `src/app/(app)/finance/_components/finance-view-v4.tsx`
 - Create: `src/tests/app/finance-internal-workspaces.test.tsx`
 
 **Interfaces:**
-- Server pages use `requireSession("finance.read")` before loading any finance-domain data。
-- Client workspaces receive serialized Decimal strings and explicit `canImport`、`canReconcile`、`canManageRules`、`canExport` flags。
+- Server pages call `requireSession("finance.read")` before loading finance-domain data.
+- Client components receive serialized Decimal strings and explicit flags: `canImport`, `canReconcile`, `canManageRules`, `canAdjust` and `canExport`.
 
-- [ ] **Step 1: Write component tests for permissions and empty states**
+- [ ] **Step 1: Write permission and empty-state UI tests**
 
 ```tsx
 it("没有导入权限时不渲染上传按钮", () => {
@@ -836,52 +709,64 @@ it("没有导入权限时不渲染上传按钮", () => {
   expect(screen.queryByRole("button", { name: "上传并预览" })).not.toBeInTheDocument();
 });
 
-it("空批次显示中文引导而不是假数据", () => {
-  render(<ImportWorkspace batches={[]} canImport={true} />);
-  expect(screen.getByText("暂无财务导入批次")).toBeInTheDocument();
+it("没有数据时不展示假金额", () => {
+  render(<LedgerWorkspace view={{ persons: [], projects: [], firm: null }} />);
+  expect(screen.getByText("暂无已提交的财务计算批次")).toBeInTheDocument();
+  expect(screen.queryByText(/¥/)).not.toBeInTheDocument();
 });
 ```
 
-- [ ] **Step 2: Implement upload preview and mapping flow**
+- [ ] **Step 2: Implement navigation and server page gates**
 
-上传界面先选择资料类型，再上传文件；解析返回的表头进入列映射步骤；只有日期、金额、收支方向映射完成且所有行无阻断错误时才显示“提交导入”。预览表只展示行号、日期、金额、方向、错误状态和必要摘要；提交动作再次上传并由服务端重新解析，不信任客户端预览。
+Render six groups: `财务总览`, `银行流水与归档`, `待办认领与归类`, `分成与个人内账`, `月结与财务交付`, `报表与核对`. Each page loads only the data required for its group. Existing `/finance/reconciliation` remains the case-level receivable/payment workspace; the new `/finance/internal/*` paths are the firm-level operating finance workspace.
 
-- [ ] **Step 3: Implement reconciliation workspace**
+The rules page uses `rules-workspace.tsx` and is reachable from the `分成与个人内账` group; it exposes draft, effective-date and publish status without exposing unmasked source evidence.
 
-页面默认显示待处理案例，提供“接受建议”“改选目标”“标记疑点”“忽略并说明”四种动作；每行显示匹配理由、金额差额、来源批次和流水行号，不展示未授权案件正文。确认动作成功后刷新队列，不使用原生 `confirm/alert/prompt`。
+- [ ] **Step 3: Implement import and reconciliation workspaces**
 
-- [ ] **Step 4: Implement rules and internal ledger workspaces**
+The import page has select kind → upload → map columns → preview rows → submit. The reconciliation page shows candidate reason, amount difference, source batch/row, target matter and decision history, with actions `接受建议`, `改选目标`, `标记疑点`, `忽略并说明`. No native `alert`, `confirm` or `prompt`; use the existing toast/dialog pattern.
 
-规则页面只允许财务规则权限用户创建草稿、查看版本、发布版本；已发布版本显示只读徽标。内部账页面支持账期、案件、律师、来源和分配类型筛选，显示“预览/已提交/存在阻断项”状态；所有金额来自服务器快照，不在客户端重算。
+- [ ] **Step 4: Implement ledger and monthly-close workspaces**
 
-- [ ] **Step 5: Add links without changing existing finance view semantics**
+Ledger supports person/project/firm view switches, period filters, drill-down to allocation lines and export. Personal view displays distributable balance and reserve balance in separate columns. Monthly close displays source coverage, blocking warnings, unresolved export/import, adjustments/reversal history, run ID/hash and artifact download buttons. Every displayed amount comes from a server snapshot.
 
-在现有 `FinancePage` 的 `FinanceViewV4` 上方增加 `InternalFinanceLinks`，只根据 `finance.read` 渲染入口；原有案件财务指标、待确认实收和 `/finance/reconciliation` 的案件应收分配保持不变。
+- [ ] **Step 5: Add a link from the existing finance page**
+
+Add an `InternalFinanceLinks` card to `FinancePage`/`FinanceViewV4` only when the user has `finance.read`. Do not alter existing KPI semantics, pending-receipt confirmation, invoice workflows, matter-level visibility or existing `finance/export` output.
 
 - [ ] **Step 6: Run UI tests and commit**
 
 Run: `npm run test:run -- src/tests/app/finance-internal-workspaces.test.tsx`
+Expected: PASS; unauthorized users cannot see write buttons, empty states contain no fabricated data, and all visible amounts carry period/run context.
 
-Expected: PASS;无权限用户看不到写操作，空状态无假数据，中文按钮和错误提示完整。
+```powershell
+git add 'src/app/(app)/finance/internal' 'src/app/(app)/finance/page.tsx' 'src/app/(app)/finance/_components/finance-view-v4.tsx' src/tests/app/finance-internal-workspaces.test.tsx
+git commit -m "feat: add internal finance workspaces"
+```
 
-Commit: `git add src/app/(app)/finance src/tests/app/finance-internal-workspaces.test.tsx && git commit -m "feat: add internal finance workspaces"`
+## 收尾阶段：文档、端到端验收与交付闸门
 
-## Task 9: 操作文档、回归验证和合成数据验收
+### Task 10: Add operations documentation and synthetic end-to-end acceptance
 
 **Files:**
-- Create: `docs/FINANCE-INTERNAL-OPERATIONS.md`
-- Create: `src/tests/server/finance-internal-acceptance.test.ts`
-- Modify: `docs/PRD.md`（仅补充已实现的第一期入口和边界，不写未来承诺）
+- Create: `docs/FINANCE-OPERATING-LOOP.md`
+- Create: `src/tests/server/finance-operating-acceptance.test.ts`
+- Modify: `docs/PRD.md` only to record implemented entry points and boundaries; do not add future promises.
 
-- [ ] **Step 1: Add a synthetic end-to-end acceptance fixture**
+- [ ] **Step 1: Write the synthetic end-to-end acceptance test**
 
-测试使用以下固定合成事实：一笔 100000.00 元渠道案件已确认收款、两名律师分成计划 60%/40%、20/45/35 规则、同日银行收入 100000.00 元、一笔同金额不同日支出。断言导入幂等、收款唯一建议、分配金额 100000.00 守恒、支出进入差异队列、预览 run 不进入报表、提交 run 可导出。
+Use the fixture from Task 0: one confirmed lawyer-fee payment, one pending receipt, one refund linked to the payment, channel/firm/lawyer split, two payroll facts, one partner tax advance and one capital flow. Assert that pending receipt is excluded, import is idempotent, matching has one unique suggestion, allocation conserves the payment amount, person/firm views share a run ID, reserve gap persists, capital is excluded from operating result and a month-close artifact lists the same run hash.
 
-- [ ] **Step 2: Write the operations document**
+- [ ] **Step 2: Run the acceptance test before full checks**
 
-文档说明导入模板字段、日期和金额口径、重复导入处理、建议匹配的依据、人工差异处理、规则版本发布、导出权限和“第一期不等同法定三表”的边界。不得写真实客户、账号、服务器密码或测试数据。
+Run: `npm run test:run -- src/tests/server/finance-operating-acceptance.test.ts`
+Expected: PASS without network access, production database access or real files.
 
-- [ ] **Step 3: Run the complete verification suite**
+- [ ] **Step 3: Write the operations guide**
+
+Document the upload formats, required fields, duplicate handling, candidate-match reasons, manual claim decisions, refund linking, rule publication, double-balance meaning, tax/capital boundaries, monthly adjustments, artifact downloads and the statement that results are management reconciliation outputs rather than statutory financial statements. Do not include real client names, contract numbers, bank accounts, passwords, VPS addresses or sample file contents.
+
+- [ ] **Step 4: Run the complete verification suite**
 
 Run in order:
 
@@ -891,20 +776,23 @@ npm run lint
 npm run typecheck
 npm run prisma:validate
 npm run build
+git diff --check HEAD~1..HEAD
+rg -n "Sofos@|BEGIN .*PRIVATE KEY|101\.34\.217\.248" src/tests src/lib/finance src/server/finance docs/FINANCE-OPERATING-LOOP.md
 ```
 
-Expected: all commands exit 0；测试输出不出现真实业务数据或密码；生产数据库和 170 VPS 不被连接或修改。
+Expected: all project checks exit 0; the final `rg` returns no sensitive credentials or production IP references; the documented public entry URL is intentionally not part of this source-secret scan; `next-env.d.ts` remains the only pre-existing worktree modification when no other user changes exist.
 
-- [ ] **Step 4: Review the final diff and commit documentation**
+- [ ] **Step 5: Review the final diff and commit documentation**
 
-Run: `git diff --check HEAD~1..HEAD`、`git status --short --branch`、`rg -n "Sofos@|BEGIN .*PRIVATE KEY" docs src/tests`
+Run: `git status --short --branch` and `git diff --stat`. Verify no real business files, generated private artifacts or database dumps are staged.
 
-Expected: 没有密钥和真实业务数据；预存的 `next-env.d.ts` 仍保持未提交，不出现在财务功能提交中。
+```powershell
+git add docs/FINANCE-OPERATING-LOOP.md docs/PRD.md src/tests/server/finance-operating-acceptance.test.ts
+git commit -m "docs: document finance operating loop and acceptance"
+```
 
-Commit: `git add docs/FINANCE-INTERNAL-OPERATIONS.md docs/PRD.md src/tests/server/finance-internal-acceptance.test.ts && git commit -m "docs: document internal finance operations"`
+## 阶段检查点与执行顺序
 
-## 执行顺序与检查点
+按 `Task 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10` 执行。每个任务单独提交并运行聚焦测试；Task 1 的迁移只在独立测试数据库演练；Task 5 的计算快照确认输入不变后才允许提交；Task 8 的月结文件只从 `COMMITTED` run 生成；Task 9 的 UI 不得改变现有案件财务入口语义。
 
-按 Task 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 顺序执行。每个 Task 单独提交并运行该 Task 的聚焦测试；Task 1 的 Prisma 迁移和 Task 6 的财务快照在独立测试数据库中演练后，才允许进入 UI。
-
-第一阶段完成后，必须由用户和外部财务老师共同核对至少一个月的合成/脱敏账：银行收入、LawLink 已确认收款、内部三层分配和外部三表差异逐项解释清楚，再决定是否单独设计正式总账域。
+阶段 1、2 完成后，由用户先用合成资料验收银行收入、Payment 门禁、案件分配和三视角报表。阶段 3、4 完成后，再用至少一个脱敏账期由用户和外部财务老师共同核对个人双余额、税款预付、资本流、月结调整和交付文件。没有这一步，不宣布财务口径已完成，也不连接生产资料。
