@@ -85,6 +85,7 @@ type Props = {
   invoiceReconciliation: InvoiceReconciliation[];
   canApproveInvoice: boolean;
   canExport: boolean;
+  canInternalRead: boolean;
   canWrite: boolean;
   /** 能否确认 / 退回律师登记的实收（财务、主任、管理员） */
   canConfirmReceipt: boolean;
@@ -103,7 +104,7 @@ const TYPE_META: Record<Entry["type"], { label: string; badge: string; sign: str
 const yuan = (n: number, digits = 0) => `¥${n.toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
 const mmdd = (d: Date | string) => shMonthDay(d);
 
-export function FinanceViewV4({ entries, monthly, aging, stats, invoiceRequests, pendingEntries, commissionEntries: commissionRows, invoiceReconciliation, canApproveInvoice, canExport, canWrite, canConfirmReceipt }: Props) {
+export function FinanceViewV4({ entries, monthly, aging, stats, invoiceRequests, pendingEntries, commissionEntries: commissionRows, invoiceReconciliation, canApproveInvoice, canExport, canInternalRead, canWrite, canConfirmReceipt }: Props) {
   const params = useSearchParams();
   const initialTab = (["ledger", "invoices", "commission", "aging"] as Tab[]).includes(params.get("tab") as Tab) ? (params.get("tab") as Tab) : "ledger";
   const [tab, setTab] = useState<Tab>(initialTab);
@@ -179,11 +180,13 @@ export function FinanceViewV4({ entries, monthly, aging, stats, invoiceRequests,
         title="财务"
         sub={`${nowSh.y} 年 ${nowSh.m} 月 · 数据截至 ${mmdd(now)} · 金额按财务查看权限范围汇总`}
         actions={
-          <div className="flex gap-2"><Link href="/finance/reconciliation" className="btn btn-secondary btn-sm">应收与收款分配</Link>{canExport ? (
+          <div className="flex gap-2">{canInternalRead ? <Link href="/finance/internal" className="btn btn-secondary btn-sm">内部经营财务</Link> : null}<Link href="/finance/reconciliation" className="btn btn-secondary btn-sm">应收与收款分配</Link>{canExport ? (
             <a href={`/api/finance/export${range ? `?days=${range}` : ""}`} className="btn btn-secondary btn-sm">导出流水</a>
           ) : null}</div>
         }
       />
+
+      {canInternalRead ? <div className="card flex flex-wrap items-center justify-between gap-3 border-[var(--teal-line)] bg-[var(--teal-soft)] px-4 py-3.5"><div><div className="text-[13px] font-[600] text-[var(--teal-deep)]">内部经营财务工作区</div><div className="mt-1 text-[11.5px] text-[var(--t-secondary)]">管理银行来源、人工认领、分成快照与月结交付；不改变案件应收和开票口径。</div></div><Link href="/finance/internal" className="btn btn-primary btn-sm">进入工作区 →</Link></div> : null}
 
       <div className="kpi-grid">
         <MetricCard

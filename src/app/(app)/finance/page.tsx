@@ -10,6 +10,7 @@ import { listInvoiceRequests, getInvoiceStats } from "@/server/invoices/actions"
 import { getInvoiceReconciliation } from "@/server/finance/invoice-reconciliation";
 import { getReceivablesAging } from "@/server/finance/aging";
 import { hasCustomPermission } from "@/lib/roles/catalog";
+import { canReadInternalFinance } from "@/server/finance/internal-workspaces";
 import { canConfirmReceipt, isManager } from "@/lib/permissions";
 import { FinanceViewV4 } from "./_components/finance-view-v4";
 
@@ -52,6 +53,7 @@ export default async function FinancePage() {
       monthly={monthly.slice(-6)}
       aging={aging}
       invoiceReconciliation={invoiceReconciliation}
+      canInternalRead={canReadInternalFinance(session!.user)}
       canExport={hasCustomPermission(session!.user, "reports.export")}
       canWrite={hasCustomPermission(session!.user, "finance.write")}
       canConfirmReceipt={canConfirmReceipt(session!.user)}
