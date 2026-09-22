@@ -35,7 +35,11 @@ export type FinanceRowError = {
     | "MISSING_AMOUNT"
     | "INVALID_AMOUNT"
     | "INVALID_DIRECTION"
-    | "INVALID_COLUMN_MAPPING";
+    | "INVALID_COLUMN_MAPPING"
+    | "UNSUPPORTED_LEGACY_XLS"
+    | "UNSUPPORTED_FILE_FORMAT"
+    | "EMPTY_WORKBOOK"
+    | "PARSE_FAILURE";
   field?: string;
   message: string;
 };

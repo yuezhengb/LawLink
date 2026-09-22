@@ -6,7 +6,7 @@
 
 **Architecture:** LawLink 的 `Matter`、`Billing`、`Receivable`、已确认 `Payment`、`FeeEntry`、`CommissionPlan` 继续作为业务事实来源；新增财务域保存来源证据、对账案例、版本化规则、不可变计算批次、个人追加式台账和月结文件。报表与导出只读取服务端持久化计算结果，不在页面临时重算，不复制 101 VPS 的源代码或业务数据。
 
-**Tech Stack:** Next.js 16 App Router、TypeScript、React 19、Prisma 5、PostgreSQL 16、Zod、Decimal、ExcelJS、SheetJS `xlsx`（仅用于 CSV/XLS/XLSX 读取）、Vitest、现有私有存储和审计服务。
+**Tech Stack:** Next.js 16 App Router、TypeScript、React 19、Prisma 5、PostgreSQL 16、Zod、Decimal、ExcelJS（读取 CSV/XLSX 并生成工作簿）、Vitest、现有私有存储和审计服务。传统 XLS 暂不在服务端解析，上传时提示转换为 XLSX，避免引入当前存在高危漏洞且无修复版本的 SheetJS 依赖。
 
 ## Global Constraints
 
@@ -101,7 +101,7 @@
 ### 复用与修改文件
 
 - `prisma/schema.prisma`：新增财务域模型和 `User`、`Matter`、`Payment` 等反向关系。
-- `package.json` / `package-lock.json`：加入固定版本的 `xlsx`，只用于结构化资料读取。
+- `package.json` / `package-lock.json`：复用现有 ExcelJS，不新增有已知高危漏洞且无修复版本的 SheetJS 依赖。
 - `src/lib/roles/catalog.ts`：增加财务域导入、认领、规则、调整和导出权限；不删除现有 `finance.read/write/confirm/correct/settle`。
 - `src/tests/lib/permissions.test.ts`、`src/tests/lib/custom-roles.test.ts`：补充权限不因管理员身份或业务管理权自动放大的断言。
 - `src/server/finance/facts.ts`：复用已确认收款和退款事实，不改变现有事实读取口径。
@@ -236,11 +236,9 @@ git add prisma/schema.prisma prisma/migrations/20260922000001_finance_operating_
 git commit -m "feat: add finance operating loop schema and permissions"
 ```
 
-### Task 2: Implement CSV/XLS/XLSX parsing, normalization and source fingerprints
+### Task 2: Implement CSV/XLSX parsing, safe legacy-XLS rejection and source fingerprints
 
 **Files:**
-- Modify: `package.json`
-- Modify: `package-lock.json`
 - Modify: `src/lib/finance/internal-types.ts`
 - Create: `src/lib/finance/import-parser.ts`
 - Create: `src/lib/finance/source-fingerprint.ts`
@@ -248,26 +246,26 @@ git commit -m "feat: add finance operating loop schema and permissions"
 - Create: `src/tests/lib/finance-source-fingerprint.test.ts`
 
 **Interfaces:**
-- Produces `parseFinanceWorkbook(bytes: Buffer, fileName: string, kind: FinanceSourceKind): FinanceParseResult`.
-- Produces `normalizeFinanceRow(input: unknown, mapping: FinanceColumnMapping): FinanceNormalizedRow | FinanceRowError`.
+- Produces `parseFinanceWorkbook(bytes: Buffer, fileName: string, kind: FinanceSourceKind, suppliedMapping?: FinanceColumnMapping): Promise<FinanceParseResult>`.
+- Produces `normalizeFinanceRow(input: unknown, mapping: FinanceColumnMapping, options: { sourceKind: FinanceSourceKind; sourceRowNumber: number }): FinanceNormalizedRow | FinanceRowError`.
 - Produces `fileSha256(bytes: Buffer): string` and `rowFingerprint(row: FinanceNormalizedRow): string`.
 
-- [ ] **Step 1: Add the fixed parser dependency**
+- [ ] **Step 1: Confirm the safe parser boundary**
 
-Add `xlsx@0.18.5` at a fixed version compatible with Node 20, using it only for reading `.csv`, `.xls` and `.xlsx`; disable formula evaluation and macro preservation for uploaded files. Keep ExcelJS for generated workbooks. Run `npm install xlsx@0.18.5 --package-lock-only` and verify the lockfile contains no unrelated dependency upgrades.
+Reuse the existing ExcelJS dependency for `.csv` and `.xlsx`; do not add SheetJS `xlsx` because the current published version is flagged by `npm audit` for high-severity prototype-pollution and ReDoS issues without a fixed package release. For `.xls`, return an explicit unsupported-format error instructing the user to convert it to `.xlsx`; never invoke an untrusted external converter in the web request.
 
 - [ ] **Step 2: Write parser tests for Chinese bank headers and bad rows**
 
-In the test file, import `* as XLSX from "xlsx"` and define the local helper `xlsxBuffer(rows)` by creating a workbook, appending `XLSX.utils.aoa_to_sheet(rows)` as `Sheet1`, and returning `Buffer.from(XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }))`; this helper is test-only and does not enter the production parser.
+In the test file, import `ExcelJS` and define the local async helper `xlsxBuffer(rows)` by creating a workbook, adding `Sheet1`, appending each row, and returning `Buffer.from(await workbook.xlsx.writeBuffer())`; this helper is test-only and does not enter the production parser.
 
 ```ts
-it("识别借方/贷方并统一为有符号金额", () => {
-  const result = parseFinanceWorkbook(xlsxBuffer([["日期", "对方户名", "借方发生额", "贷方发生额", "余额"], ["2026-08-01", "合成客户", "", "100000.00", "100000.00"]]), "银行流水.xlsx", "BANK_STATEMENT");
+it("识别借方/贷方并统一为有符号金额", async () => {
+  const result = await parseFinanceWorkbook(xlsxBuffer([["日期", "对方户名", "借方发生额", "贷方发生额", "余额"], ["2026-08-01", "合成客户", "", "100000.00", "100000.00"]]), "银行流水.xlsx", "BANK_STATEMENT");
   expect(result.rows[0]).toMatchObject({ occurredAt: "2026-08-01", amount: "100000.00", direction: "CREDIT" });
 });
 
-it("缺少日期或金额时返回行级错误而不是静默丢弃", () => {
-  const result = parseFinanceWorkbook(xlsxBuffer([["摘要", "金额"], ["缺日期", "100.00"]]), "bad.xlsx", "BANK_STATEMENT");
+it("缺少日期或金额时返回行级错误而不是静默丢弃", async () => {
+  const result = await parseFinanceWorkbook(xlsxBuffer([["摘要", "金额"], ["缺日期", "100.00"]]), "bad.xlsx", "BANK_STATEMENT");
   expect(result.errors[0]).toMatchObject({ code: "MISSING_OCCURRED_AT", rowNumber: 2 });
 });
 ```
@@ -286,10 +284,10 @@ Use a stable serializer that sorts object keys and normalizes whitespace before 
 - [ ] **Step 5: Run tests and commit**
 
 Run: `npm run test:run -- src/tests/lib/finance-import-parser.test.ts src/tests/lib/finance-source-fingerprint.test.ts`
-Expected: PASS for `.csv`, `.xls`, `.xlsx`, Chinese headers, negative expenses, duplicate rows and missing-field errors.
+Expected: PASS for `.csv`, `.xlsx`, safe rejection of `.xls`, Chinese headers, negative expenses, duplicate rows and missing-field errors.
 
 ```powershell
-git add package.json package-lock.json src/lib/finance/internal-types.ts src/lib/finance/import-parser.ts src/lib/finance/source-fingerprint.ts src/tests/lib/finance-import-parser.test.ts src/tests/lib/finance-source-fingerprint.test.ts
+git add src/lib/finance/internal-types.ts src/lib/finance/import-parser.ts src/lib/finance/source-fingerprint.ts src/tests/lib/finance-import-parser.test.ts src/tests/lib/finance-source-fingerprint.test.ts docs/superpowers/plans/2026-09-22-law-firm-finance.md
 git commit -m "feat: normalize finance source files"
 ```
 
