@@ -16,6 +16,9 @@ tsconfig.tsbuildinfo
 .env
 .env.*
 !.env.example
+.admin-password
+/data/
+docker-compose.preview.yml
 
 storage
 backups
