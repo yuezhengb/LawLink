@@ -4,6 +4,7 @@ import {
   normalizeFinanceRow,
   parseFinanceWorkbook
 } from "@/lib/finance/import-parser";
+import { parseFinanceSource } from "@/lib/finance/finance-source-parser";
 
 async function xlsxBuffer(rows: unknown[][]): Promise<Buffer> {
   const workbook = new ExcelJS.Workbook();
@@ -40,7 +41,7 @@ describe("财务来源文件解析", () => {
         ["2026/08/02", "办公室租金", "1,200.50"]
       ]),
       "费用.xlsx",
-      "OTHER"
+      "BANK_STATEMENT"
     );
 
     expect(result.rows[0]).toMatchObject({
@@ -83,6 +84,64 @@ describe("财务来源文件解析", () => {
       rowNumber: 2
     });
     expect(result.totalRows).toBe(1);
+  });
+
+  it("工资资料按工资字段解析，不伪造银行交易日期和方向", async () => {
+    const result = await parseFinanceSource(
+      Buffer.from("月份,姓名,申报工资,实际支付,自担社保\n2026-08,合成人员甲,15000.00,12000.00,800.00", "utf8"),
+      "synthetic-payroll.csv",
+      "PAYROLL"
+    );
+
+    expect(result).toMatchObject({
+      kind: "PAYROLL",
+      period: "2026-08",
+      rows: [{ sourceRowNumber: 2, displayName: "合成人员甲", declaredSalary: "15000.00", actualCashPaid: "12000.00", selfCostDue: "800.00" }],
+      errors: []
+    });
+  });
+
+  it("花名册没有日期金额列时仍能解析，并要求显式截至日期", async () => {
+    const result = await parseFinanceSource(
+      Buffer.from("姓名,身份,在册期间\n合成人员甲,律师,在册", "utf8"),
+      "synthetic-roster.csv",
+      "ROSTER",
+      { asOfDay: "2026-08-31" }
+    );
+
+    expect(result).toMatchObject({
+      kind: "ROSTER",
+      asOfDay: "2026-08-31",
+      rows: [{ sourceRowNumber: 2, displayName: "合成人员甲", roleLabel: "律师" }],
+      errors: []
+    });
+  });
+
+  it("外部三表解析为报表核对行，不要求银行方向", async () => {
+    const result = await parseFinanceSource(
+      Buffer.from("期间,报表,项目,期末金额\n2026-08,资产负债表,货币资金,100000.00", "utf8"),
+      "synthetic-external.csv",
+      "EXTERNAL_THREE_STATEMENTS"
+    );
+
+    expect(result).toMatchObject({
+      kind: "EXTERNAL_THREE_STATEMENTS",
+      period: "2026-08",
+      rows: [{ sourceRowNumber: 2, statement: "BALANCE_SHEET", item: "货币资金", amount: "100000.00" }],
+      errors: []
+    });
+  });
+
+  it("工资文件缺少必需字段时报告行号和错误，不生成银行流水", async () => {
+    const result = await parseFinanceSource(
+      Buffer.from("月份,姓名,申报工资,实际支付,自担社保\n2026-08,合成人员甲,不是金额,0,0", "utf8"),
+      "synthetic-payroll.csv",
+      "PAYROLL"
+    );
+
+    expect(result.kind).toBe("PAYROLL");
+    expect(result.rows).toEqual([]);
+    expect(result.errors[0]).toMatchObject({ rowNumber: 2, code: "INVALID_AMOUNT" });
   });
 
   it("传统 XLS 返回明确的转换提示，不调用不受信任的转换器", async () => {

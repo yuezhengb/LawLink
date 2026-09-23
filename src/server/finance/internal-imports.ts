@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { auditStrict as auditStrictDefault, auditTx } from "@/server/audit";
 import { requireSession } from "@/lib/auth/session";
 import { ActionError } from "@/lib/action-error";
@@ -5,12 +6,15 @@ import { prisma } from "@/lib/prisma";
 import { storage as storageDefault, type StorageProvider } from "@/lib/storage";
 import { scopeFor, type RoleGrant } from "@/lib/roles/catalog";
 import { fileSha256, rowFingerprint } from "@/lib/finance/source-fingerprint";
-import { parseFinanceWorkbook } from "@/lib/finance/import-parser";
+import { parseFinanceSource } from "@/lib/finance/finance-source-parser";
 import type {
   CommitFinanceImportInput,
   FinanceColumnMapping,
   FinanceImportPreview,
   FinanceNormalizedRow,
+  FinancePayrollImportRow,
+  FinanceRosterImportRow,
+  FinanceExternalStatementImportRow,
   FinanceSourceKind
 } from "@/lib/finance/internal-types";
 import type { Prisma, PrismaClient } from "@prisma/client";
@@ -18,6 +22,7 @@ import {
   commitFinanceImportSchema,
   financeColumnMappingSchema,
   financeImportKindSchema,
+  financePeriodSchema,
   MAX_FINANCE_IMPORT_BYTES,
   sourceDownloadSchema
 } from "@/server/finance/internal-schemas";
@@ -99,7 +104,7 @@ function parseKind(formData: FormData): FinanceSourceKind {
   return result.data;
 }
 
-async function readUpload(formData: FormData): Promise<{ fileName: string; bytes: Buffer; kind: FinanceSourceKind; mapping?: FinanceColumnMapping }> {
+async function readUpload(formData: FormData): Promise<{ fileName: string; bytes: Buffer; kind: FinanceSourceKind; mapping?: FinanceColumnMapping; period?: string; asOfDay?: string }> {
   const candidate = formData.get("file") ?? formData.get("sourceFile");
   if (!candidate || typeof candidate !== "object" || typeof (candidate as { arrayBuffer?: unknown }).arrayBuffer !== "function") {
     throw new ActionError("缺少财务资料文件");
@@ -114,17 +119,37 @@ async function readUpload(formData: FormData): Promise<{ fileName: string; bytes
   if (bytes.byteLength > MAX_FINANCE_IMPORT_BYTES) {
     throw new ActionError("财务资料不能超过 25 MB");
   }
-  return { fileName, bytes, kind: parseKind(formData), mapping: parseMapping(formData) };
+  const rawPeriod = formData.get("period");
+  const periodResult = rawPeriod === null || rawPeriod === "" ? undefined : financePeriodSchema.safeParse(String(rawPeriod));
+  if (periodResult && !periodResult.success) throw new ActionError("账期格式应为 YYYY-MM");
+  const rawAsOfDay = formData.get("asOfDay");
+  const asOfDay = rawAsOfDay === null || rawAsOfDay === "" ? undefined : String(rawAsOfDay);
+  if (asOfDay && !/^\d{4}-\d{2}-\d{2}$/.test(asOfDay)) throw new ActionError("花名册截至日期格式不正确");
+  return { fileName, bytes, kind: parseKind(formData), mapping: parseMapping(formData), period: periodResult?.success ? periodResult.data : undefined, asOfDay };
 }
 
-function safePreviewRows(rows: FinanceNormalizedRow[]): FinanceNormalizedRow[] {
-  return rows.map((row) => ({
-    ...row,
-    sourceBatchId: undefined,
-    sourceFileId: undefined,
-    counterparty: truncate(row.counterparty, 160),
-    description: truncate(row.description, 300)
-  }));
+function maskedName(value: string): string {
+  if (value.length < 2) return "*";
+  return `${value.slice(0, 1)}${"*".repeat(Math.min(4, value.length - 1))}`;
+}
+
+function safePreviewRows(rows: FinanceImportPreview["rows"]): FinanceImportPreview["rows"] {
+  return rows.map((row) => {
+    if ("occurredAt" in row) {
+      const bankRow = row as FinanceNormalizedRow;
+      return {
+        ...bankRow,
+        sourceBatchId: undefined,
+        sourceFileId: undefined,
+        counterparty: truncate(bankRow.counterparty, 160),
+        description: truncate(bankRow.description, 300)
+      };
+    }
+    if ("displayName" in row) {
+      return { ...row, displayName: maskedName(row.displayName) };
+    }
+    return row;
+  });
 }
 
 export async function previewFinanceImport(
@@ -133,15 +158,18 @@ export async function previewFinanceImport(
 ): Promise<FinanceImportPreview> {
   void _dependencies;
   const upload = await readUpload(formData);
-  const result = await parseFinanceWorkbook(upload.bytes, upload.fileName, upload.kind, upload.mapping);
+  const result = await parseFinanceSource(upload.bytes, upload.fileName, upload.kind, upload);
   return {
     fileName: upload.fileName,
     kind: upload.kind,
     headers: result.headers,
     rows: safePreviewRows(result.rows),
     errors: result.errors,
-    validCount: result.rows.length,
-    totalRows: result.totalRows
+    validCount: result.kind === "OTHER" ? result.totalRows : result.rows.length,
+    totalRows: result.totalRows,
+    reviewWarnings: result.reviewWarnings,
+    period: result.period,
+    asOfDay: result.asOfDay
   };
 }
 
@@ -165,6 +193,69 @@ function dataForSourceRow(row: FinanceNormalizedRow, batchId: string, sourceFile
   };
 }
 
+function digestValue(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function dataForTypedRecord(
+  row: FinancePayrollImportRow | FinanceRosterImportRow | FinanceExternalStatementImportRow,
+  kind: "PAYROLL" | "ROSTER" | "EXTERNAL_THREE_STATEMENTS",
+  batchId: string
+): Prisma.FinanceImportRecordCreateManyInput {
+  if (kind === "PAYROLL") {
+    const payroll = row as FinancePayrollImportRow;
+    const normalized = { period: payroll.period, declaredSalary: payroll.declaredSalary, actualCashPaid: payroll.actualCashPaid, selfCostDue: payroll.selfCostDue };
+    return {
+      batchId,
+      sourceRow: payroll.sourceRowNumber,
+      kind,
+      period: payroll.period,
+      declaredSalary: payroll.declaredSalary,
+      actualCashPaid: payroll.actualCashPaid,
+      selfCostDue: payroll.selfCostDue,
+      normalizedDigest: digestValue(normalized),
+      reviewStatus: "NEEDS_REVIEW"
+    };
+  }
+  if (kind === "ROSTER") {
+    const roster = row as FinanceRosterImportRow;
+    const normalized = { asOfDay: roster.asOfDay, roleLabel: roster.roleLabel };
+    return {
+      batchId,
+      sourceRow: roster.sourceRowNumber,
+      kind,
+      period: roster.asOfDay.slice(0, 7),
+      asOfDay: dayStartInShanghai(roster.asOfDay),
+      roleLabel: truncate(roster.roleLabel, 100),
+      normalizedDigest: digestValue(normalized),
+      reviewStatus: "NEEDS_REVIEW"
+    };
+  }
+  const statement = row as FinanceExternalStatementImportRow;
+  const normalized = { period: statement.period, statement: statement.statement, item: statement.item, amount: statement.amount };
+  return {
+    batchId,
+    sourceRow: statement.sourceRowNumber,
+    kind,
+    period: statement.period,
+    statement: statement.statement,
+    item: truncate(statement.item, 200),
+    amount: statement.amount,
+    normalizedDigest: digestValue(normalized),
+    reviewStatus: "NEEDS_REVIEW"
+  };
+}
+
+function periodBounds(period: string): { start: Date; end: Date } {
+  const [year, month] = period.split("-").map(Number);
+  const nextYear = month === 12 ? year + 1 : year;
+  const nextMonth = month === 12 ? 1 : month + 1;
+  return {
+    start: dayStartInShanghai(`${period}-01`),
+    end: dayStartInShanghai(`${nextYear}-${String(nextMonth).padStart(2, "0")}-01`)
+  };
+}
+
 export async function commitFinanceImport(
   input: CommitFinanceImportInput,
   dependencies: FinanceImportDependencies = {}
@@ -175,7 +266,7 @@ export async function commitFinanceImport(
   if (data.bytes.byteLength > MAX_FINANCE_IMPORT_BYTES) throw new ActionError("财务资料不能超过 25 MB");
 
   const fileName = safeFileName(data.fileName);
-  const parsed = await parseFinanceWorkbook(data.bytes, fileName, data.kind, data.mapping);
+  const parsed = await parseFinanceSource(data.bytes, fileName, data.kind, data);
   if (parsed.totalRows === 0) throw new ActionError("文件中没有可提交的数据行");
   if (parsed.errors.length > 0) {
     throw new ActionError(`导入未提交：有 ${parsed.errors.length} 行需要先修正`);
@@ -193,9 +284,17 @@ export async function commitFinanceImport(
   const actorId = dependencies.actorId ?? (await requireSession("finance.import")).user.id;
   const storageProvider = dependencies.storage ?? storageDefault;
   const storagePath = await storageProvider.writeFile("finance-imports", data.bytes);
-  const occurredDays = parsed.rows.map((row) => row.occurredAt).sort();
-  const periodStart = dayStartInShanghai(occurredDays[0]);
-  const periodEnd = dayStartInShanghai(occurredDays[occurredDays.length - 1]);
+  let period: string | undefined;
+  if (parsed.kind === "BANK_STATEMENT") {
+    const occurredDays = parsed.rows.map((row) => row.occurredAt).sort();
+    if (!occurredDays.length) throw new ActionError("文件中没有可提交的银行流水");
+    period = occurredDays[0].slice(0, 7);
+    if (occurredDays.some((day) => day.slice(0, 7) !== period)) throw new ActionError("银行流水文件包含多个账期，请按月拆分后导入");
+  } else {
+    period = parsed.period ?? data.period ?? (parsed.kind === "ROSTER" ? parsed.asOfDay?.slice(0, 7) : undefined);
+  }
+  if (!period) throw new ActionError("无法确定资料账期，请选择或填写 YYYY-MM");
+  const { start: periodStart, end: periodEnd } = periodBounds(period);
 
   try {
     const committed = await db.$transaction(async (tx) => {
@@ -207,7 +306,7 @@ export async function commitFinanceImport(
           status: "COMMITTED",
           periodStart,
           periodEnd,
-          rowCount: parsed.rows.length,
+          rowCount: parsed.kind === "OTHER" ? parsed.totalRows : parsed.rows.length,
           errorCount: 0,
           createdById: actorId
         },
@@ -224,21 +323,27 @@ export async function commitFinanceImport(
         },
         select: { id: true }
       });
-      await tx.financeSourceRow.createMany({
-        data: parsed.rows.map((row) => dataForSourceRow(row, batch.id, sourceFile.id))
-      });
-      const sourceRows = await tx.financeSourceRow.findMany({
-        where: { batchId: batch.id },
-        select: { id: true }
-      });
-      await tx.financeReconciliationCase.createMany({
-        data: sourceRows.map((sourceRow) => ({
-          batchId: batch.id,
-          sourceRowId: sourceRow.id,
-          status: "UNRESOLVED",
-          suggestions: []
-        }))
-      });
+      if (parsed.kind === "BANK_STATEMENT") {
+        await tx.financeSourceRow.createMany({
+          data: parsed.rows.map((row) => dataForSourceRow(row, batch.id, sourceFile.id))
+        });
+        const sourceRows = await tx.financeSourceRow.findMany({
+          where: { batchId: batch.id },
+          select: { id: true }
+        });
+        await tx.financeReconciliationCase.createMany({
+          data: sourceRows.map((sourceRow) => ({
+            batchId: batch.id,
+            sourceRowId: sourceRow.id,
+            status: "UNRESOLVED",
+            suggestions: []
+          }))
+        });
+      } else if (parsed.kind === "PAYROLL" || parsed.kind === "ROSTER" || parsed.kind === "EXTERNAL_THREE_STATEMENTS") {
+        await tx.financeImportRecord.createMany({
+          data: parsed.rows.map((row) => dataForTypedRecord(row, parsed.kind, batch.id))
+        });
+      }
       await auditTx(tx, {
         userId: actorId,
         action: "FINANCE_INTERNAL_IMPORT_COMMIT",
@@ -248,7 +353,7 @@ export async function commitFinanceImport(
           kind: data.kind,
           fileExtension: extensionOf(fileName),
           byteCount: data.bytes.byteLength,
-          rowCount: parsed.rows.length
+          rowCount: parsed.kind === "OTHER" ? parsed.totalRows : parsed.rows.length
         }
       });
       return batch;

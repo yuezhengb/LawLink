@@ -31,11 +31,12 @@ export function ReconciliationWorkspace({ queue, period, canReconcile }: { queue
   const [busy, setBusy] = useState<string | null>(null);
   const unresolved = useMemo(() => queue.items.filter((item) => !["CONFIRMED", "IGNORED"].includes(item.status)), [queue.items]);
 
-  async function decide(caseId: string, decision: "CONFIRM" | "SUSPECT" | "IGNORE") {
+  async function decide(caseId: string, decision: "CONFIRM" | "SUSPECT" | "IGNORE" | "REFUND") {
     const paymentId = selected[caseId] ?? queue.items.find((item) => item.id === caseId)?.suggestions[0]?.paymentId;
     const reason = reasons[caseId]?.trim();
-    if (decision === "CONFIRM" && !paymentId) {
-      toast.error("请先选择一个已确认收款");
+    const item = queue.items.find((candidate) => candidate.id === caseId);
+    if ((decision === "CONFIRM" || decision === "REFUND") && !paymentId) {
+      toast.error(decision === "REFUND" ? "请先选择一笔已登记退款的原付款" : "请先选择一个已确认收款");
       return;
     }
     if (decision !== "CONFIRM" && !reason) {
@@ -44,14 +45,20 @@ export function ReconciliationWorkspace({ queue, period, canReconcile }: { queue
     }
     setBusy(`${caseId}-${decision}`);
     try {
-      const response = await fetch(`/api/finance/internal/reconciliation/${encodeURIComponent(caseId)}/decision`, {
+      const isRefund = decision === "REFUND";
+      const response = await fetch(isRefund ? "/api/finance/internal/refund-links" : `/api/finance/internal/reconciliation/${encodeURIComponent(caseId)}/decision`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ decision, paymentId, reason })
+        body: JSON.stringify(isRefund ? {
+          sourceRowId: item?.sourceRowId,
+          paymentId,
+          amount: item?.row.amount.startsWith("-") ? item.row.amount.slice(1) : "",
+          reason
+        } : { decision, paymentId, reason })
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(typeof body.error === "string" ? body.error : "对账决定提交失败");
-      toast.success(decision === "CONFIRM" ? "已确认归类" : decision === "SUSPECT" ? "已标记疑点" : "已忽略该来源行");
+      toast.success(isRefund ? "退款已关联并纳入分配复核" : decision === "CONFIRM" ? "已确认归类" : decision === "SUSPECT" ? "已标记疑点" : "已忽略该来源行");
       router.refresh();
     } catch (error) {
       toast.error(actionErrorMessage(error));
@@ -84,7 +91,7 @@ export function ReconciliationWorkspace({ queue, period, canReconcile }: { queue
   );
 }
 
-function ReconciliationRow({ item, selected, reason, canReconcile, busy, onSelect, onReason, onDecide }: { item: ReconciliationWorkspaceQueue["items"][number]; selected: string; reason: string; canReconcile: boolean; busy: boolean; onSelect: (value: string) => void; onReason: (value: string) => void; onDecide: (decision: "CONFIRM" | "SUSPECT" | "IGNORE") => void }) {
+function ReconciliationRow({ item, selected, reason, canReconcile, busy, onSelect, onReason, onDecide }: { item: ReconciliationWorkspaceQueue["items"][number]; selected: string; reason: string; canReconcile: boolean; busy: boolean; onSelect: (value: string) => void; onReason: (value: string) => void; onDecide: (decision: "CONFIRM" | "SUSPECT" | "IGNORE" | "REFUND") => void }) {
   return (
     <article className="rounded-[10px] border border-[var(--bd-hair)] bg-card p-3.5 transition-colors hover:border-[var(--bd-default)]">
       <div className="flex flex-wrap items-start gap-3">
@@ -98,19 +105,21 @@ function ReconciliationRow({ item, selected, reason, canReconcile, busy, onSelec
       </div>
       {item.suggestions.length > 0 ? (
         <div className="mt-3 rounded-[8px] bg-[var(--bg-sunken)] p-3">
-          <div className="mb-2 text-[11.5px] font-[600] text-[var(--t-secondary)]">系统建议</div>
+          <div className="mb-2 text-[11.5px] font-[600] text-[var(--t-secondary)]">{item.row.direction === "DEBIT" ? "可关联的已登记退款" : "系统建议"}</div>
           <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_150px] md:items-center">
             <select aria-label={`选择来源行 ${item.row.sourceRowNumber} 的目标`} className="ll-form-control h-[34px] w-full rounded-[8px] border border-input bg-card px-2 text-[12px]" value={selected} onChange={(event) => onSelect(event.target.value)} disabled={!canReconcile || busy}>
-              {item.suggestions.map((suggestion) => <option key={suggestion.paymentId} value={suggestion.paymentId}>{mask(suggestion.paymentId)} · {suggestion.score} 分 · {suggestion.reason}</option>)}
+              {item.suggestions.map((suggestion) => <option key={suggestion.paymentId} value={suggestion.paymentId}>{mask(suggestion.paymentId)} · {suggestion.score} 分 · {suggestion.reason}{suggestion.candidateSummary ? ` · ${suggestion.candidateSummary}` : ""}</option>)}
             </select>
             <div className="flex items-center justify-end gap-1.5 text-[11px] text-[var(--t-muted)]"><span className="font-mono">候选得分</span><strong className="text-[var(--teal-deep)]">{item.suggestions[0].score}</strong><ChevronRight className="h-3 w-3" aria-hidden="true" /></div>
           </div>
         </div>
-      ) : <div className="mt-3 rounded-[8px] bg-[var(--bg-sunken)] px-3 py-2.5 text-[11.5px] text-[var(--t-muted)]">暂未找到可自动建议的已确认律师费收款，需要人工核对来源。</div>}
+      ) : <div className="mt-3 rounded-[8px] bg-[var(--bg-sunken)] px-3 py-2.5 text-[11.5px] text-[var(--t-muted)]">{item.row.direction === "DEBIT" ? "没有金额足够且尚未关联的已登记退款余额；请先核对原付款的退款冲销记录。" : "暂未找到可自动建议的已确认律师费收款，需要人工核对来源。"}</div>}
       <div className="mt-3 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
-        <label className="block space-y-1 text-[11px] text-[var(--t-muted)]"><span>疑点或忽略理由（标记疑点、忽略时必填）</span><Input aria-label={`来源行 ${item.row.sourceRowNumber} 的处理理由`} value={reason} onChange={(event) => onReason(event.target.value)} disabled={!canReconcile || busy} placeholder="例如：需与合同收款人进一步核对" /></label>
+        <label className="block space-y-1 text-[11px] text-[var(--t-muted)]"><span>{item.row.direction === "DEBIT" ? "退款关联说明（必填）" : "疑点或忽略理由（标记疑点、忽略时必填）"}</span><Input aria-label={`来源行 ${item.row.sourceRowNumber} 的处理理由`} value={reason} onChange={(event) => onReason(event.target.value)} disabled={!canReconcile || busy} placeholder={item.row.direction === "DEBIT" ? "说明该银行退款对应的原收款" : "例如：需与合同收款人进一步核对"} /></label>
         <div className="flex flex-wrap justify-end gap-1.5">
-          <Button type="button" size="sm" disabled={!canReconcile || busy || !item.suggestions.length || item.status === "CONFIRMED"} onClick={() => onDecide("CONFIRM")}><Check aria-hidden="true" />接受建议</Button>
+          {item.row.direction === "DEBIT"
+            ? <Button type="button" size="sm" disabled={!canReconcile || busy || !item.suggestions.length || item.status === "CONFIRMED"} onClick={() => onDecide("REFUND")}>关联退款</Button>
+            : <Button type="button" size="sm" disabled={!canReconcile || busy || !item.suggestions.length || item.status === "CONFIRMED"} onClick={() => onDecide("CONFIRM")}><Check aria-hidden="true" />接受建议</Button>}
           <Button type="button" size="sm" variant="danger" disabled={!canReconcile || busy || item.status === "SUSPECT"} onClick={() => onDecide("SUSPECT")}>标记疑点</Button>
           <Button type="button" size="sm" variant="ghost" disabled={!canReconcile || busy || item.status === "IGNORED"} onClick={() => onDecide("IGNORE")}>忽略并说明</Button>
         </div>

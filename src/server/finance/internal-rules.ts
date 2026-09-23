@@ -113,6 +113,7 @@ export async function publishFinanceRule(
     if (version.publishedAt) throw new ActionError("已发布规则不可修改");
     const definition = financeRuleDefinitionSchema.safeParse(version.definition);
     if (!definition.success) throw new ActionError("规则定义不完整或日期区间不合法");
+    if (definition.data.calculationBase !== "GROSS") throw new ActionError("请按收款总额基数重新建规则草稿");
     const overlap = await tx.financeRuleVersion.findFirst({
       where: {
         ruleSetId: version.ruleSetId,
@@ -156,6 +157,12 @@ export async function setFinanceMatterProfile(
   const db = dependencies.db ?? prisma;
   const matter = await db.matter.findFirst({ where: { id: data.matterId, deletedAt: null }, select: { id: true } });
   if (!matter) throw new ActionError("案件不存在或已删除");
+  if (data.roleAssignments.length) {
+    const userIds = [...new Set(data.roleAssignments.map((assignment) => assignment.userId))];
+    const users = await db.user.findMany({ where: { id: { in: userIds }, active: true }, select: { id: true } });
+    const activeUserIds = new Set(users.map((user) => user.id));
+    if (userIds.some((userId) => !activeUserIds.has(userId))) throw new ActionError("人员不存在或已停用，不能配置案件分配");
+  }
 
   return db.$transaction(async (tx) => {
     const profile = await tx.financeMatterProfile.upsert({
@@ -166,6 +173,7 @@ export async function setFinanceMatterProfile(
         lawyerLevel: data.lawyerLevel ?? null,
         channelLabel: data.channelLabel ?? null,
         participantIds: data.participantIds,
+        roleAssignments: data.roleAssignments,
         internalNote: data.internalNote ?? null,
         activeRuleSetId: data.activeRuleSetId ?? null,
         updatedById: actor.id
@@ -175,6 +183,7 @@ export async function setFinanceMatterProfile(
         lawyerLevel: data.lawyerLevel ?? null,
         channelLabel: data.channelLabel ?? null,
         participantIds: data.participantIds,
+        roleAssignments: data.roleAssignments,
         internalNote: data.internalNote ?? null,
         activeRuleSetId: data.activeRuleSetId ?? null,
         updatedById: actor.id

@@ -31,7 +31,9 @@ export const commitFinanceImportSchema = z.object({
   fileName: z.string().trim().min(1).max(255),
   kind: financeImportKindSchema,
   bytes: z.custom<Buffer>((value) => Buffer.isBuffer(value), "导入内容必须是二进制文件"),
-  mapping: financeColumnMappingSchema.optional()
+  mapping: financeColumnMappingSchema.optional(),
+  period: financePeriodSchema.optional(),
+  asOfDay: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
 });
 
 export const sourceDownloadSchema = z.object({

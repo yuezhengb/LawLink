@@ -296,7 +296,7 @@ function nonEmptyRow(row: string[]): boolean {
 function mapMatrix(
   matrix: Matrix,
   fileName: string,
-  kind: FinanceSourceKind,
+  kind: "BANK_STATEMENT",
   suppliedMapping?: FinanceColumnMapping
 ): FinanceParseResult {
   const firstDataRow = matrix.findIndex(nonEmptyRow);
@@ -408,52 +408,37 @@ async function readXlsx(bytes: Buffer): Promise<Matrix> {
   return matrix;
 }
 
-export async function parseFinanceWorkbook(
+export async function readFinanceMatrix(
   bytes: Buffer,
-  fileName: string,
-  kind: FinanceSourceKind,
-  suppliedMapping?: FinanceColumnMapping
-): Promise<FinanceParseResult> {
+  fileName: string
+): Promise<{ matrix: Matrix; errors: FinanceRowError[] }> {
   const extension = fileName.toLowerCase().split(".").pop() ?? "";
   if (extension === "xls") {
     return {
-      fileName,
-      kind,
-      headers: [],
-      rows: [],
-      errors: [
-        error(
-          0,
-          "UNSUPPORTED_LEGACY_XLS",
-          "传统 XLS 格式暂不支持，请先在本地转换为 XLSX 后重新上传；服务器不会执行外部转换器。"
-        )
-      ],
-      totalRows: 0
+      matrix: [],
+      errors: [error(0, "UNSUPPORTED_LEGACY_XLS", "传统 XLS 格式暂不支持，请先在本地转换为 XLSX 后重新上传；服务器不会执行外部转换器。")]
     };
   }
   if (extension !== "csv" && extension !== "xlsx") {
-    return {
-      fileName,
-      kind,
-      headers: [],
-      rows: [],
-      errors: [error(0, "UNSUPPORTED_FILE_FORMAT", "仅支持 CSV 或 XLSX 文件")],
-      totalRows: 0
-    };
+    return { matrix: [], errors: [error(0, "UNSUPPORTED_FILE_FORMAT", "仅支持 CSV 或 XLSX 文件")] };
   }
-
   try {
     const matrix = extension === "csv" ? parseCsv(bytes.toString("utf8")) : await readXlsx(bytes);
-    return mapMatrix(matrix, fileName, kind, suppliedMapping);
+    if (!matrix.some(nonEmptyRow)) return { matrix, errors: [error(0, "EMPTY_WORKBOOK", "文件中没有可读取的数据")] };
+    return { matrix, errors: [] };
   } catch (caught) {
     const detail = caught instanceof Error ? caught.message : "未知解析错误";
-    return {
-      fileName,
-      kind,
-      headers: [],
-      rows: [],
-      errors: [error(0, "PARSE_FAILURE", `文件解析失败：${detail}`)],
-      totalRows: 0
-    };
+    return { matrix: [], errors: [error(0, "PARSE_FAILURE", `文件解析失败：${detail}`)] };
   }
+}
+
+export async function parseFinanceWorkbook(
+  bytes: Buffer,
+  fileName: string,
+  kind: "BANK_STATEMENT",
+  suppliedMapping?: FinanceColumnMapping
+): Promise<FinanceParseResult> {
+  const result = await readFinanceMatrix(bytes, fileName);
+  if (result.errors.length > 0) return { fileName, kind, headers: [], rows: [], errors: result.errors, totalRows: 0 };
+  return mapMatrix(result.matrix, fileName, kind, suppliedMapping);
 }

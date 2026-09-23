@@ -1,0 +1,31 @@
+import type { FinanceRosterImportRow, FinanceRowError } from "@/lib/finance/internal-types";
+import { cell, columnIndex, parseDay, readTypedTable, rowError } from "@/lib/finance/typed-import-utils";
+
+export async function parseRosterWorkbook(bytes: Buffer, fileName: string, selectedAsOfDay?: string) {
+  const table = await readTypedTable(bytes, fileName, ["name", "role"]);
+  const errors: FinanceRowError[] = [...table.errors];
+  const asOfDay = selectedAsOfDay ? parseDay(selectedAsOfDay) : null;
+  if (!table.errors.length && !asOfDay) errors.push(rowError(0, "MISSING_AS_OF_DAY", "请在上传表单中指定花名册截至日期", "asOfDay"));
+  const nameIndex = columnIndex(table.headers, "name");
+  const roleIndex = columnIndex(table.headers, "role");
+  const rows: FinanceRosterImportRow[] = [];
+  for (const row of table.rows) {
+    const displayName = cell(row, nameIndex);
+    const roleLabel = cell(row, roleIndex);
+    if (!displayName) errors.push(rowError(row.sourceRowNumber, "MISSING_NAME", "花名册行缺少姓名", "name"));
+    if (!roleLabel) errors.push(rowError(row.sourceRowNumber, "INVALID_COLUMN_MAPPING", "花名册行缺少身份/岗位", "role"));
+    if (asOfDay && displayName && roleLabel) rows.push({ sourceRowNumber: row.sourceRowNumber, asOfDay, displayName, roleLabel });
+  }
+  const names = rows.map((row) => row.displayName.trim().toLocaleLowerCase());
+  const hasDuplicateNames = names.some((name, index) => names.indexOf(name) !== index);
+  return {
+    fileName,
+    kind: "ROSTER" as const,
+    headers: table.headers,
+    rows,
+    errors,
+    totalRows: table.totalRows,
+    asOfDay: asOfDay ?? undefined,
+    reviewWarnings: hasDuplicateNames ? ["存在同名人员，归档后必须人工匹配，不会自动关联到系统用户。"] : []
+  };
+}

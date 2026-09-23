@@ -2,7 +2,8 @@ import { shDayKey } from "@/lib/ui/sh-time";
 import type {
   ConfirmedPaymentCandidate,
   FinanceMatchSuggestion,
-  FinanceNormalizedRow
+  FinanceNormalizedRow,
+  RefundPaymentCandidate
 } from "@/lib/finance/internal-types";
 
 function canonicalAmount(value: string): string | null {
@@ -38,6 +39,23 @@ function dayDistance(left: string, right: string): number | null {
     return Date.UTC(year, month - 1, day);
   };
   return Math.abs(toUtcDay(leftKey) - toUtcDay(rightKey)) / 86_400_000;
+}
+
+function amountCents(value: string): number | null {
+  const normalized = canonicalAmount(value);
+  if (!normalized) return null;
+  const negative = normalized.startsWith("-");
+  const unsigned = negative ? normalized.slice(1) : normalized;
+  const [integer, decimals] = unsigned.split(".");
+  if (integer.length > 12) return null;
+  const cents = Number(integer) * 100 + Number(decimals);
+  if (!Number.isSafeInteger(cents)) return null;
+  return negative ? -cents : cents;
+}
+
+function fromCents(value: number): string {
+  const absolute = Math.abs(value);
+  return `${value < 0 ? "-" : ""}${Math.floor(absolute / 100)}.${String(absolute % 100).padStart(2, "0")}`;
 }
 
 function sameReference(row: FinanceNormalizedRow, candidate: ConfirmedPaymentCandidate): boolean {
@@ -82,4 +100,31 @@ export function rankPaymentCandidates(
     reason,
     autoConfirm: score >= 90 && highScoreCount === 1
   }));
+}
+
+/** Refund candidates are hints only: amount and available registered refund balance never prove identity. */
+export function rankRefundCandidates(
+  row: FinanceNormalizedRow,
+  candidates: RefundPaymentCandidate[]
+): FinanceMatchSuggestion[] {
+  if (row.direction !== "DEBIT") return [];
+  const rowCents = amountCents(row.amount);
+  if (rowCents === null || rowCents >= 0) return [];
+  const requestedCents = -rowCents;
+  return candidates.flatMap((candidate) => {
+    const refundedCents = amountCents(candidate.refundedAmount);
+    const linkedCents = amountCents(candidate.linkedRefundAmount);
+    if (refundedCents === null || linkedCents === null || refundedCents <= 0 || linkedCents < 0) return [];
+    const remainingCents = refundedCents - linkedCents;
+    if (remainingCents < requestedCents) return [];
+    const exact = remainingCents === requestedCents;
+    return [{
+      paymentId: candidate.paymentId,
+      score: exact ? 80 : 60,
+      confidence: exact ? "MEDIUM" as const : "LOW" as const,
+      reason: exact ? "金额等于尚未关联的已登记退款，仍需人工确认来源" : "已登记退款余额足够，需人工核对具体付款",
+      autoConfirm: false,
+      candidateSummary: `案件 ${candidate.matterCode} · 原收款 ${dayKey(candidate.occurredAt) ?? "日期未知"} · 可关联退款 ¥${fromCents(remainingCents)}`
+    }];
+  }).sort((left, right) => right.score - left.score || left.paymentId.localeCompare(right.paymentId));
 }

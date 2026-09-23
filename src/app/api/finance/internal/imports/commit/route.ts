@@ -23,10 +23,14 @@ export async function POST(req: Request) {
     }
     const upload = file as { name?: unknown; arrayBuffer: () => Promise<ArrayBuffer> };
     const rawKind = formData.get("kind") ?? "BANK_STATEMENT";
+    const rawPeriod = formData.get("period");
+    const rawAsOfDay = formData.get("asOfDay");
     const input: CommitFinanceImportInput = {
       fileName: typeof upload.name === "string" ? upload.name : "finance-import",
       kind: String(rawKind) as CommitFinanceImportInput["kind"],
-      bytes: Buffer.from(await upload.arrayBuffer())
+      bytes: Buffer.from(await upload.arrayBuffer()),
+      period: typeof rawPeriod === "string" && rawPeriod ? rawPeriod : undefined,
+      asOfDay: typeof rawAsOfDay === "string" && rawAsOfDay ? rawAsOfDay : undefined
     };
     const result = await commitFinanceImport(input, { actorId: session.user.id });
     return NextResponse.json(result);
