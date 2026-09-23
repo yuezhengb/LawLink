@@ -39,7 +39,12 @@ export type FinanceRowError = {
     | "UNSUPPORTED_LEGACY_XLS"
     | "UNSUPPORTED_FILE_FORMAT"
     | "EMPTY_WORKBOOK"
-    | "PARSE_FAILURE";
+    | "PARSE_FAILURE"
+    | "MISSING_PERIOD"
+    | "INVALID_PERIOD"
+    | "MISSING_NAME"
+    | "MISSING_AS_OF_DAY"
+    | "INVALID_STATEMENT";
   field?: string;
   message: string;
 };
@@ -58,11 +63,14 @@ export type FinanceColumnMapping = Partial<Record<
 
 export type FinanceParseResult = {
   fileName: string;
-  kind: FinanceSourceKind;
+  kind: "BANK_STATEMENT";
   headers: string[];
   rows: FinanceNormalizedRow[];
   errors: FinanceRowError[];
   totalRows: number;
+  reviewWarnings?: string[];
+  period?: string;
+  asOfDay?: string;
 };
 
 export type FinanceImportStatus = "PREVIEW" | "COMMITTED" | "FAILED" | "REJECTED";
@@ -109,6 +117,15 @@ export type FinanceMatchSuggestion = {
   confidence: "HIGH" | "MEDIUM" | "LOW";
   reason: string;
   autoConfirm: boolean;
+  candidateSummary?: string;
+};
+
+export type RefundPaymentCandidate = {
+  paymentId: string;
+  matterCode: string;
+  occurredAt: string;
+  refundedAmount: FinanceDecimal;
+  linkedRefundAmount: FinanceDecimal;
 };
 
 export type ReconciliationQuery = {
@@ -138,6 +155,7 @@ export type RefundLinkInput = {
 export type ReconciliationQueue = {
   items: Array<{
     id: string;
+    sourceRowId: string;
     status: FinanceMatchStatus;
     row: FinanceNormalizedRow;
     suggestions: FinanceMatchSuggestion[];
@@ -149,10 +167,13 @@ export type FinanceImportPreview = {
   fileName: string;
   kind: FinanceSourceKind;
   headers: string[];
-  rows: FinanceNormalizedRow[];
+  rows: Array<FinanceNormalizedRow | FinancePayrollImportRow | FinanceRosterImportRow | FinanceExternalStatementImportRow>;
   errors: FinanceRowError[];
   validCount: number;
   totalRows: number;
+  reviewWarnings?: string[];
+  period?: string;
+  asOfDay?: string;
 };
 
 export type CommitFinanceImportInput = {
@@ -160,6 +181,8 @@ export type CommitFinanceImportInput = {
   kind: FinanceSourceKind;
   bytes: Buffer;
   mapping?: FinanceColumnMapping;
+  period?: string;
+  asOfDay?: string;
 };
 
 export type FinanceRuleDefinition = {
@@ -197,6 +220,7 @@ export type PersonalDoubleBalanceInput = {
   openingReserve: FinanceDecimal;
   earnedIncome: FinanceDecimal;
   selfCostDue: FinanceDecimal;
+  reserveTargetMonthlyCost?: FinanceDecimal;
   selfFundingIn: FinanceDecimal;
   withdrawn: FinanceDecimal;
   partnerTaxAdvance: FinanceDecimal;
@@ -205,6 +229,7 @@ export type PersonalDoubleBalanceInput = {
 
 export type PersonalDoubleBalance = {
   selfFundingUsed: FinanceDecimal;
+  selfCostChargedToIncome: FinanceDecimal;
   selfFundingReserveEnd: FinanceDecimal;
   reserveGap: FinanceDecimal;
   distributableEnd: FinanceDecimal;
@@ -217,10 +242,68 @@ export type FirmOperatingResultInput = {
   partnerTaxAdvance: FinanceDecimal;
   firmSalary: FinanceDecimal;
   firmSocial: FinanceDecimal;
+  firmFund?: FinanceDecimal;
   rent: FinanceDecimal;
+  office?: FinanceDecimal;
+  otherCosts?: FinanceDecimal;
   channel: FinanceDecimal;
   lawyer: FinanceDecimal;
   taxes: FinanceDecimal;
+};
+
+export type FinancePayrollImportRow = {
+  sourceRowNumber: number;
+  period: string;
+  displayName: string;
+  declaredSalary: FinanceDecimal;
+  actualCashPaid: FinanceDecimal;
+  selfCostDue: FinanceDecimal;
+};
+
+export type FinanceRosterImportRow = {
+  sourceRowNumber: number;
+  asOfDay: string;
+  displayName: string;
+  roleLabel: string;
+};
+
+export type FinanceExternalStatementImportRow = {
+  sourceRowNumber: number;
+  period: string;
+  statement: "BALANCE_SHEET" | "INCOME" | "CASH_FLOW";
+  item: string;
+  amount: FinanceDecimal;
+};
+
+export type FinanceTypedParseResult<T, K extends FinanceSourceKind> = {
+  fileName: string;
+  kind: K;
+  headers: string[];
+  rows: T[];
+  errors: FinanceRowError[];
+  totalRows: number;
+  reviewWarnings?: string[];
+  period?: string;
+  asOfDay?: string;
+};
+
+export type FinanceSourceParseResult =
+  | FinanceParseResult
+  | FinanceTypedParseResult<FinancePayrollImportRow, "PAYROLL">
+  | FinanceTypedParseResult<FinanceRosterImportRow, "ROSTER">
+  | FinanceTypedParseResult<FinanceExternalStatementImportRow, "EXTERNAL_THREE_STATEMENTS">
+  | FinanceTypedParseResult<never, "OTHER">;
+
+export type FinanceSourceParseOptions = { period?: string; asOfDay?: string };
+
+export type FinancePeriodCoverageInput = {
+  bankAccounts: Array<{ alias: string; batchIds: string[]; noTransactionsReason?: string }>;
+  payrollBatchIds: string[];
+  noPayrollReason?: string;
+  rosterBatchIds: string[];
+  noRosterReason?: string;
+  externalBatchIds: string[];
+  noExternalReason?: string;
 };
 
 export type FirmOperatingResult = {

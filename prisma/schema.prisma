@@ -456,19 +456,27 @@ model User {
   intakeSubmissions IntakeRevision[]
   confirmedFinanceCorrections FinanceCorrection[] @relation("FinanceCorrectionConfirmer")
   financeImportBatchesCreated FinanceImportBatch[] @relation("FinanceImportBatchCreator")
+  financeImportRecordsResolved FinanceImportRecord[] @relation("FinanceImportRecordResolvedUser")
   financeClaimDecisions FinanceClaimDecision[] @relation("FinanceClaimDecisionDecider")
   financeMatterProfilesUpdated FinanceMatterProfile[] @relation("FinanceMatterProfileUpdater")
   financeRuleSetsCreated FinanceRuleSet[] @relation("FinanceRuleSetCreator")
   financeRuleVersionsPublished FinanceRuleVersion[] @relation("FinanceRuleVersionPublisher")
   financeCalculationRunsCreated FinanceCalculationRun[] @relation("FinanceCalculationRunCreator")
   financeAllocationLinesTargeted FinanceAllocationLine[] @relation("FinanceAllocationTarget")
+  financeAllocationRecipients FinanceAllocationRecipient[] @relation("FinanceAllocationRecipientUser")
   financePersonLedgerEntries FinancePersonLedgerEntry[] @relation("FinancePersonLedgerTarget")
   financePayrollFacts FinancePayrollFact[] @relation("FinancePayrollUser")
+  financePayrollRevisions FinancePayrollFactRevision[] @relation("FinancePayrollRevisionActor")
+  financeOpeningBalances FinanceOpeningBalance[] @relation("FinanceOpeningBalanceUser")
+  financeOpeningBalancesConfirmed FinanceOpeningBalance[] @relation("FinanceOpeningBalanceConfirmer")
+  financePersonPeriodSnapshots FinancePersonPeriodSnapshot[] @relation("FinancePersonSnapshotUser")
+  financeOperatingCostsCreated FinanceOperatingCost[] @relation("FinanceOperatingCostCreator")
   financePartnerTaxRecords FinancePartnerTaxRecord[] @relation("FinancePartnerTaxUser")
   financeCapitalFlows FinanceCapitalFlow[] @relation("FinanceCapitalInvestor")
   financeAdjustmentsCreated FinanceAdjustment[] @relation("FinanceAdjustmentCreator")
   financeAdjustmentsTargeted FinanceAdjustment[] @relation("FinanceAdjustmentTarget")
   financeMonthlyClosesCreated FinanceMonthlyClose[] @relation("FinanceMonthlyCloseCreator")
+  financePeriodCoveragesConfirmed FinancePeriodCoverage[] @relation("FinancePeriodCoverageConfirmer")
   invoicePaymentAllocations InvoicePaymentAllocation[] @relation("InvoiceAllocationRecorder")
   commissionSettlements CommissionSettlement[] @relation("CommissionSettlementRecorder")
   confirmedReceivableConditions Receivable[] @relation("ReceivableConditionConfirmer")
@@ -3074,6 +3082,36 @@ enum FinanceMatterOrigin {
   OTHER
 }
 
+enum FinanceImportReviewStatus {
+  NEEDS_REVIEW
+  RESOLVED
+  REJECTED
+}
+
+enum FinanceExternalStatementKind {
+  BALANCE_SHEET
+  INCOME
+  CASH_FLOW
+}
+
+enum FinanceAllocationRole {
+  SOURCE
+  HANDLING
+  CO
+}
+
+enum FinanceAllocationSourceKind {
+  PAYMENT
+  REFUND
+}
+
+enum FinanceOperatingCostCategory {
+  RENT
+  OFFICE
+  TURNOVER_TAX
+  OTHER
+}
+
 enum FinanceLedgerEntryKind {
   EARNED_INCOME
   SELF_COST
@@ -3139,6 +3177,7 @@ model FinanceImportBatch {
   createdBy User @relation("FinanceImportBatchCreator", fields: [createdById], references: [id], onDelete: Restrict)
   sourceFile FinanceSourceFile?
   sourceRows FinanceSourceRow[]
+  typedRecords FinanceImportRecord[]
   reconciliationCases FinanceReconciliationCase[]
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -3184,6 +3223,7 @@ model FinanceSourceRow {
   metadata Json?
   reconciliationCase FinanceReconciliationCase?
   refundLinks FinanceRefundLink[]
+  operatingCosts FinanceOperatingCost[]
   createdAt DateTime @default(now())
 
   @@unique([batchId, sourceRow])
@@ -3242,6 +3282,7 @@ model FinanceRefundLink {
   active Boolean @default(true)
   createdById String
   createdAt DateTime @default(now())
+  allocationLines FinanceAllocationLine[]
 
   @@unique([sourceRowId, paymentId])
   @@index([paymentId, active])
@@ -3255,6 +3296,7 @@ model FinanceMatterProfile {
   lawyerLevel String? @db.VarChar(60)
   channelLabel String? @db.VarChar(120)
   participantIds Json @default("[]")
+  roleAssignments Json @default("[]")
   internalNote String? @db.VarChar(1000)
   activeRuleSetId String?
   updatedById String
@@ -3314,6 +3356,8 @@ model FinanceCalculationRun {
   createdBy User @relation("FinanceCalculationRunCreator", fields: [createdById], references: [id], onDelete: Restrict)
   allocationLines FinanceAllocationLine[]
   personLedgerEntries FinancePersonLedgerEntry[]
+  personPeriodSnapshots FinancePersonPeriodSnapshot[]
+  firmPeriodSnapshot FinanceFirmPeriodSnapshot?
   monthlyClose FinanceMonthlyClose?
   artifacts FinanceArtifact[]
 
@@ -3328,6 +3372,10 @@ model FinanceAllocationLine {
   run FinanceCalculationRun @relation(fields: [runId], references: [id], onDelete: Restrict)
   paymentId String
   payment Payment @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  sourceKind FinanceAllocationSourceKind @default(PAYMENT)
+  refundLinkId String?
+  refundLink FinanceRefundLink? @relation(fields: [refundLinkId], references: [id], onDelete: Restrict)
+  sourceOccurredAt DateTime?
   matterId String
   matter Matter @relation(fields: [matterId], references: [id], onDelete: Restrict)
   targetUserId String?
@@ -3339,12 +3387,56 @@ model FinanceAllocationLine {
   sourceAmount Decimal @default(0) @db.Decimal(14, 2)
   handlingAmount Decimal @default(0) @db.Decimal(14, 2)
   coAmount Decimal @default(0) @db.Decimal(14, 2)
+  recipients FinanceAllocationRecipient[]
   createdAt DateTime @default(now())
 
+  @@unique([runId, refundLinkId])
   @@index([runId])
   @@index([paymentId])
   @@index([matterId])
   @@index([targetUserId])
+  @@index([sourceKind, sourceOccurredAt])
+}
+
+model FinanceImportRecord {
+  id String @id @default(cuid())
+  batchId String
+  batch FinanceImportBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  sourceRow Int
+  kind FinanceImportKind
+  period String? @db.VarChar(7)
+  asOfDay DateTime?
+  roleLabel String? @db.VarChar(100)
+  statement FinanceExternalStatementKind?
+  item String? @db.VarChar(200)
+  amount Decimal? @db.Decimal(14, 2)
+  declaredSalary Decimal? @db.Decimal(14, 2)
+  actualCashPaid Decimal? @db.Decimal(14, 2)
+  selfCostDue Decimal? @db.Decimal(14, 2)
+  normalizedDigest String @db.VarChar(64)
+  resolvedUserId String?
+  resolvedUser User? @relation("FinanceImportRecordResolvedUser", fields: [resolvedUserId], references: [id], onDelete: Restrict)
+  reviewStatus FinanceImportReviewStatus @default(NEEDS_REVIEW)
+  createdAt DateTime @default(now())
+
+  @@unique([batchId, sourceRow])
+  @@index([period, kind, reviewStatus])
+  @@index([resolvedUserId])
+}
+
+model FinanceAllocationRecipient {
+  id String @id @default(cuid())
+  allocationLineId String
+  allocationLine FinanceAllocationLine @relation(fields: [allocationLineId], references: [id], onDelete: Restrict)
+  userId String
+  user User @relation("FinanceAllocationRecipientUser", fields: [userId], references: [id], onDelete: Restrict)
+  role FinanceAllocationRole
+  shareRate Decimal @db.Decimal(8, 6)
+  amount Decimal @db.Decimal(14, 2)
+  createdAt DateTime @default(now())
+
+  @@unique([allocationLineId, userId, role])
+  @@index([userId, createdAt])
 }
 
 model FinancePersonLedgerEntry {
@@ -3379,14 +3471,119 @@ model FinancePayrollFact {
   incomeTax Decimal @default(0) @db.Decimal(14, 2)
   otherDeduction Decimal @default(0) @db.Decimal(14, 2)
   reimbursement Decimal @default(0) @db.Decimal(14, 2)
+  isDeemedWage Boolean @default(false)
+  actualCashPaid Decimal @default(0) @db.Decimal(14, 2)
+  selfCostDue Decimal @default(0) @db.Decimal(14, 2)
+  firmSalaryCost Decimal @default(0) @db.Decimal(14, 2)
+  firmSocialCost Decimal @default(0) @db.Decimal(14, 2)
+  firmFundCost Decimal @default(0) @db.Decimal(14, 2)
+  treatmentReviewed Boolean @default(false)
+  treatmentNote String? @db.VarChar(1000)
+  revision Int @default(1)
   actualPaymentPeriod String? @db.VarChar(7)
   sourceBatchId String?
   createdById String
+  revisions FinancePayrollFactRevision[]
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@unique([userId, period])
   @@index([period])
+}
+
+model FinancePayrollFactRevision {
+  id String @id @default(cuid())
+  payrollFactId String
+  payrollFact FinancePayrollFact @relation(fields: [payrollFactId], references: [id], onDelete: Restrict)
+  version Int
+  before Json?
+  after Json
+  changedById String
+  changedBy User @relation("FinancePayrollRevisionActor", fields: [changedById], references: [id], onDelete: Restrict)
+  changedAt DateTime @default(now())
+
+  @@unique([payrollFactId, version])
+  @@index([changedById, changedAt])
+}
+
+model FinanceOpeningBalance {
+  id String @id @default(cuid())
+  userId String @unique
+  user User @relation("FinanceOpeningBalanceUser", fields: [userId], references: [id], onDelete: Restrict)
+  firstPeriod String @db.VarChar(7)
+  distributable Decimal @db.Decimal(14, 2)
+  reserve Decimal @db.Decimal(14, 2)
+  evidenceRef String @db.VarChar(200)
+  confirmedById String
+  confirmedBy User @relation("FinanceOpeningBalanceConfirmer", fields: [confirmedById], references: [id], onDelete: Restrict)
+  confirmedAt DateTime @default(now())
+  createdAt DateTime @default(now())
+
+  @@index([firstPeriod])
+}
+
+model FinancePersonPeriodSnapshot {
+  id String @id @default(cuid())
+  runId String
+  run FinanceCalculationRun @relation(fields: [runId], references: [id], onDelete: Restrict)
+  userId String
+  user User @relation("FinancePersonSnapshotUser", fields: [userId], references: [id], onDelete: Restrict)
+  period String @db.VarChar(7)
+  openingDistributable Decimal @db.Decimal(14, 2)
+  openingReserve Decimal @db.Decimal(14, 2)
+  earned Decimal @db.Decimal(14, 2)
+  selfCostDue Decimal @db.Decimal(14, 2)
+  selfFundingIn Decimal @db.Decimal(14, 2)
+  selfFundingUsed Decimal @db.Decimal(14, 2)
+  selfCostChargedToIncome Decimal @db.Decimal(14, 2)
+  withdrawn Decimal @db.Decimal(14, 2)
+  partnerTaxAdvance Decimal @db.Decimal(14, 2)
+  unsettledHold Decimal @db.Decimal(14, 2)
+  distributableEnd Decimal @db.Decimal(14, 2)
+  reserveEnd Decimal @db.Decimal(14, 2)
+  reserveGap Decimal @db.Decimal(14, 2)
+  createdAt DateTime @default(now())
+
+  @@unique([runId, userId])
+  @@index([userId, period])
+}
+
+model FinanceFirmPeriodSnapshot {
+  id String @id @default(cuid())
+  runId String @unique
+  run FinanceCalculationRun @relation(fields: [runId], references: [id], onDelete: Restrict)
+  period String @db.VarChar(7)
+  feeRevenue Decimal @db.Decimal(14, 2)
+  channelAmount Decimal @db.Decimal(14, 2)
+  lawyerAmount Decimal @db.Decimal(14, 2)
+  firmSalaryCost Decimal @db.Decimal(14, 2)
+  firmSocialCost Decimal @db.Decimal(14, 2)
+  firmFundCost Decimal @db.Decimal(14, 2)
+  rentCost Decimal @db.Decimal(14, 2)
+  officeCost Decimal @db.Decimal(14, 2)
+  turnoverTaxCost Decimal @db.Decimal(14, 2)
+  otherCost Decimal @db.Decimal(14, 2)
+  operatingResult Decimal @db.Decimal(14, 2)
+  createdAt DateTime @default(now())
+
+  @@index([period])
+}
+
+model FinanceOperatingCost {
+  id String @id @default(cuid())
+  period String @db.VarChar(7)
+  category FinanceOperatingCostCategory
+  amount Decimal @db.Decimal(14, 2)
+  sourceRowId String?
+  sourceRow FinanceSourceRow? @relation(fields: [sourceRowId], references: [id], onDelete: Restrict)
+  evidenceRef String? @db.VarChar(200)
+  description String @db.VarChar(1000)
+  createdById String
+  createdBy User @relation("FinanceOperatingCostCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt DateTime @default(now())
+
+  @@index([period, category])
+  @@index([sourceRowId])
 }
 
 model FinancePartnerTaxRecord {
@@ -3448,7 +3645,8 @@ model FinanceAdjustment {
 
 model FinanceMonthlyClose {
   id String @id @default(cuid())
-  period String @unique @db.VarChar(7)
+  period String @db.VarChar(7)
+  revision Int @default(1)
   runId String? @unique
   run FinanceCalculationRun? @relation(fields: [runId], references: [id], onDelete: Restrict)
   sourceHash String? @db.VarChar(64)
@@ -3468,6 +3666,17 @@ model FinanceMonthlyClose {
   updatedAt DateTime @updatedAt
 
   @@index([status, updatedAt])
+  @@unique([period, revision])
+}
+
+model FinancePeriodCoverage {
+  id String @id @default(cuid())
+  period String @unique @db.VarChar(7)
+  details Json
+  confirmedById String
+  confirmedBy User @relation("FinancePeriodCoverageConfirmer", fields: [confirmedById], references: [id], onDelete: Restrict)
+  confirmedAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model FinanceArtifact {

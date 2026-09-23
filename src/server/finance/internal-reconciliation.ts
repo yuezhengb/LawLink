@@ -7,7 +7,7 @@ import { matterFinanceVisibilityFilter } from "@/lib/permissions";
 import { scopeFor, type RoleGrant } from "@/lib/roles/catalog";
 import { shDayKey } from "@/lib/ui/sh-time";
 import { rowFingerprint } from "@/lib/finance/source-fingerprint";
-import { rankPaymentCandidates } from "@/lib/finance/internal-matching";
+import { rankPaymentCandidates, rankRefundCandidates } from "@/lib/finance/internal-matching";
 import type {
   ConfirmedPaymentCandidate,
   FinanceMatchStatus,
@@ -17,6 +17,7 @@ import type {
   ReconciliationDecisionInput,
   ReconciliationQuery,
   ReconciliationQueue,
+  RefundPaymentCandidate,
   RefundLinkInput
 } from "@/lib/finance/internal-types";
 import type { PrismaClient } from "@prisma/client";
@@ -146,7 +147,8 @@ export async function listFinanceReconciliationCases(
     take: pageSize
   });
 
-  const candidates = await db.payment.findMany({
+  const hasCreditCases = cases.some((item) => item.sourceRow.direction === "CREDIT");
+  const candidates = hasCreditCases ? await db.payment.findMany({
     where: {
       moneyKind: "LAWYER_FEE",
       sourceEntry: { confirmState: "CONFIRMED" },
@@ -165,13 +167,42 @@ export async function listFinanceReconciliationCases(
       moneyKind: true,
       sourceEntry: { select: { confirmState: true, invoiceNo: true } }
     }
-  });
+  }) : [];
   const candidateRows = candidates.map(paymentToCandidate);
+  const hasDebitCases = cases.some((item) => item.sourceRow.direction === "DEBIT");
+  const refundRows = hasDebitCases ? await db.payment.findMany({
+    where: {
+      moneyKind: "LAWYER_FEE",
+      refundedAmount: { gt: 0 },
+      sourceEntry: { confirmState: "CONFIRMED" },
+      matter: {
+        deletedAt: null,
+        ...matterFinanceVisibilityFilter(actor.id, actor.role, actor.rolePermissions ?? undefined)
+      }
+    },
+    select: {
+      id: true,
+      occurredAt: true,
+      refundedAmount: true,
+      financeRefundLinks: { where: { active: true }, select: { amount: true } },
+      matter: { select: { internalCode: true } }
+    }
+  }) : [];
+  const refundCandidates: RefundPaymentCandidate[] = refundRows.map((payment) => ({
+    paymentId: payment.id,
+    matterCode: payment.matter.internalCode,
+    occurredAt: shDayKey(payment.occurredAt),
+    refundedAmount: asMoney(payment.refundedAmount),
+    linkedRefundAmount: asMoney(payment.financeRefundLinks.reduce((sum, link) => sum.plus(new Prisma.Decimal(link.amount)), new Prisma.Decimal(0)))
+  }));
   const items = cases.map((item) => {
     const row = sourceToNormalizedRow(item.sourceRow);
-    const suggestions = rankPaymentCandidates(row, candidateRows);
+    const suggestions = row.direction === "DEBIT"
+      ? rankRefundCandidates(row, refundCandidates)
+      : rankPaymentCandidates(row, candidateRows);
     return {
       id: item.id,
+      sourceRowId: item.sourceRow.id,
       status: item.status as FinanceMatchStatus,
       row,
       suggestions
@@ -291,33 +322,54 @@ export async function linkFinanceRefund(
 
   const db = dependencies.db ?? prisma;
   return db.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "FinanceSourceRow" WHERE id=${input.sourceRowId} FOR UPDATE`;
     const source = await tx.financeSourceRow.findUnique({
       where: { id: input.sourceRowId },
       include: { reconciliationCase: true }
     });
     if (!source || !source.reconciliationCase) throw new ActionError("来源行不存在或尚未生成对账案例");
+    if (source.reconciliationCase.status === "IGNORED") throw new ActionError("已忽略的对账来源不能再关联退款");
+    if (source.reconciliationCase.status === "CONFIRMED" && source.reconciliationCase.paymentId && source.reconciliationCase.paymentId !== input.paymentId) {
+      throw new ActionError("该来源已关联到其他付款，不能改作退款");
+    }
     const sourceAmount = new Prisma.Decimal(source.amount);
-    if (source.direction !== "DEBIT" || !sourceAmount.lt(0) || amount.gt(sourceAmount.abs())) {
-      throw new ActionError("退款关联金额必须落在退款来源行范围内");
+    if (source.direction !== "DEBIT" || !sourceAmount.lt(0) || !amount.eq(sourceAmount.abs())) {
+      throw new ActionError("退款关联金额必须等于退款来源行金额");
     }
     const active = await tx.financeRefundLink.findFirst({
       where: { sourceRowId: input.sourceRowId, active: true },
+      select: { id: true, paymentId: true, amount: true }
+    });
+    if (active) {
+      if (active.paymentId === input.paymentId && new Prisma.Decimal(active.amount).eq(amount)) return { linkId: active.id };
+      throw new ActionError("该来源行已有有效退款关联");
+    }
+    const paymentWhere = {
+      id: input.paymentId,
+      moneyKind: "LAWYER_FEE" as const,
+      sourceEntry: { confirmState: "CONFIRMED" as const },
+      matter: {
+        deletedAt: null,
+        ...matterFinanceVisibilityFilter(actor.id, actor.role, actor.rolePermissions ?? undefined)
+      }
+    };
+    const visiblePayment = await tx.payment.findFirst({
+      where: paymentWhere,
       select: { id: true }
     });
-    if (active) throw new ActionError("该来源行已有有效退款关联");
+    if (!visiblePayment) throw new ActionError("退款只能关联可见且已确认的律师费收款");
+    await tx.$queryRaw`SELECT id FROM "Payment" WHERE id=${input.paymentId} FOR UPDATE`;
     const payment = await tx.payment.findFirst({
-      where: {
-        id: input.paymentId,
-        moneyKind: "LAWYER_FEE",
-        sourceEntry: { confirmState: "CONFIRMED" },
-        matter: {
-          deletedAt: null,
-          ...matterFinanceVisibilityFilter(actor.id, actor.role, actor.rolePermissions ?? undefined)
-        }
-      },
-      select: { id: true }
+      where: paymentWhere,
+      select: { id: true, amount: true, refundedAmount: true }
     });
-    if (!payment) throw new ActionError("退款只能关联可见且已确认的律师费收款");
+    if (!payment) throw new ActionError("原律师费收款已变化，请刷新后重试");
+    const existingLinks = await tx.financeRefundLink.findMany({ where: { paymentId: input.paymentId, active: true }, select: { amount: true } });
+    const alreadyLinked = existingLinks.reduce((sum, row) => sum.plus(new Prisma.Decimal(row.amount)), new Prisma.Decimal(0));
+    const totalLinked = alreadyLinked.plus(amount);
+    if (totalLinked.gt(new Prisma.Decimal(payment.refundedAmount)) || totalLinked.gt(new Prisma.Decimal(payment.amount))) {
+      throw new ActionError("尚未完整登记退款冲销，退款关联金额超过收款已登记退款金额");
+    }
 
     const link = await tx.financeRefundLink.create({
       data: {
@@ -330,6 +382,16 @@ export async function linkFinanceRefund(
       },
       select: { id: true }
     });
+    if (source.reconciliationCase.status !== "CONFIRMED") {
+      const note = `退款关联：${input.reason.trim()}`;
+      await tx.financeClaimDecision.create({
+        data: { caseId: source.reconciliationCase.id, decision: "CONFIRM", paymentId: input.paymentId, reason: note, decidedById: actor.id }
+      });
+      await tx.financeReconciliationCase.update({
+        where: { id: source.reconciliationCase.id },
+        data: { status: "CONFIRMED", paymentId: input.paymentId, reason: note }
+      });
+    }
     await auditTx(tx, {
       userId: actor.id,
       action: "FINANCE_INTERNAL_REFUND_LINK",

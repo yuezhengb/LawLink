@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { rankPaymentCandidates } from "@/lib/finance/internal-matching";
-import type { ConfirmedPaymentCandidate, FinanceNormalizedRow } from "@/lib/finance/internal-types";
+import { rankPaymentCandidates, rankRefundCandidates } from "@/lib/finance/internal-matching";
+import type { ConfirmedPaymentCandidate, FinanceNormalizedRow, RefundPaymentCandidate } from "@/lib/finance/internal-types";
 
 function row(date: string, amount: string, direction: "CREDIT" | "DEBIT" = "CREDIT"): FinanceNormalizedRow {
   return {
@@ -69,5 +69,25 @@ describe("财务内部对账匹配", () => {
 
   it("支出行不自动认领收入付款", () => {
     expect(rankPaymentCandidates(row("2026-08-01", "100.00", "DEBIT"), [payment("p", "2026-08-01", "100.00")])).toEqual([]);
+  });
+
+  it("退款候选以尚未关联的已登记冲销余额匹配，跨月也只给人工候选", () => {
+    const refundRow = row("2026-08-20", "-80.00", "DEBIT");
+    const candidates: RefundPaymentCandidate[] = [
+      { paymentId: "refund-match", matterCode: "SYN-001", occurredAt: "2026-02-01", refundedAmount: "100.00", linkedRefundAmount: "20.00" },
+      { paymentId: "refund-larger", matterCode: "SYN-002", occurredAt: "2026-03-01", refundedAmount: "120.00", linkedRefundAmount: "20.00" }
+    ];
+
+    const suggestions = rankRefundCandidates(refundRow, candidates);
+
+    expect(suggestions[0]).toMatchObject({ paymentId: "refund-match", score: 80, autoConfirm: false, reason: expect.stringContaining("人工确认") });
+    expect(suggestions[0].candidateSummary).toContain("SYN-001");
+    expect(suggestions.every((item) => item.autoConfirm === false)).toBe(true);
+  });
+
+  it("退款超过所有可关联冲销余额时不建议，收入行也不产生退款候选", () => {
+    const candidate: RefundPaymentCandidate = { paymentId: "refund-short", matterCode: "SYN-003", occurredAt: "2026-08-01", refundedAmount: "10.00", linkedRefundAmount: "5.00" };
+    expect(rankRefundCandidates(row("2026-08-20", "-6.00", "DEBIT"), [candidate])).toEqual([]);
+    expect(rankRefundCandidates(row("2026-08-20", "6.00", "CREDIT"), [candidate])).toEqual([]);
   });
 });

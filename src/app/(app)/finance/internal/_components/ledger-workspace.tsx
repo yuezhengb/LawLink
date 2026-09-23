@@ -9,7 +9,8 @@ import type { InternalLedgerView } from "./types";
 
 type LedgerTab = "persons" | "projects" | "firm";
 
-function money(value: string): string {
+function money(value: string | null): string {
+  if (value === null) return "待核对";
   const parsed = Number(value);
   return Number.isFinite(parsed) ? `¥${parsed.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : value;
 }
@@ -69,21 +70,38 @@ function ProjectTable({ view }: { view: InternalLedgerView }) {
   if (view.projects.length === 0) return <EmptyTable text="本批次没有客户项目归属行" />;
   return (
     <div className="space-y-2.5">
-      {view.projects.map((project) => <div key={project.matterId} className="rounded-[8px] border border-[var(--bd-hair)] px-3.5 py-3"><div className="flex flex-wrap items-baseline justify-between gap-2"><div><span className="font-mono text-[11px] text-[var(--t-muted)]">{project.matterCode || mask(project.matterId)}</span><span className="ml-2 text-[13px] font-[600]">{project.matterTitle || "未命名项目"}</span></div><span className="text-[11px] text-[var(--t-faint)]">客户引用已掩码</span></div><div className="mt-2 overflow-x-auto"><table className="mo-table min-w-[700px] text-[11.5px]"><thead><tr><th>付款引用</th><th className="text-right">总额</th><th className="text-right">渠道</th><th className="text-right">律所</th><th className="text-right">案源</th><th className="text-right">承办</th><th className="text-right">协办</th></tr></thead><tbody>{project.lines.map((line) => <tr key={line.sourcePaymentId}><td className="font-mono">{mask(line.sourcePaymentId)}</td><td className="text-right font-mono">{money(line.grossAmount)}</td><td className="text-right font-mono">{money(line.channelAmount)}</td><td className="text-right font-mono">{money(line.firmAmount)}</td><td className="text-right font-mono">{money(line.sourceAmount)}</td><td className="text-right font-mono">{money(line.handlingAmount)}</td><td className="text-right font-mono">{money(line.coAmount)}</td></tr>)}</tbody></table></div></div>)}
+      {view.projects.map((project) => <div key={project.matterId} className="rounded-[8px] border border-[var(--bd-hair)] px-3.5 py-3"><div className="flex flex-wrap items-baseline justify-between gap-2"><div><span className="font-mono text-[11px] text-[var(--t-muted)]">{project.matterCode || mask(project.matterId)}</span><span className="ml-2 text-[13px] font-[600]">{project.matterTitle || "未命名项目"}</span></div><span className="text-[11px] text-[var(--t-faint)]">客户引用已掩码</span></div>
+        <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+          <ProjectMetric label="案件标的额" value={project.claimAmount} missing="未录入" />
+          <ProjectMetric label="现行签约律师费" value={project.signedContractAmount} missing="未登记" />
+          <ProjectMetric label="累计已开票净额" value={project.issuedInvoiceNetAmount} />
+          <ProjectMetric label="累计确认净收款" value={project.confirmedNetReceiptAmount} />
+          <ProjectMetric label="本期分配净额（含退款）" value={project.periodAllocationAmount} />
+        </div>
+        <div className="mt-3 overflow-x-auto"><table className="mo-table min-w-[900px] text-[11.5px]"><thead><tr><th>来源类型</th><th>发生日期</th><th>付款引用</th><th>退款关联</th><th className="text-right">本期金额</th><th className="text-right">渠道</th><th className="text-right">律所</th><th className="text-right">案源</th><th className="text-right">承办</th><th className="text-right">协办</th></tr></thead><tbody>{project.lines.map((line) => <tr key={`${line.sourceKind}:${line.refundLinkId ?? line.sourcePaymentId}`}><td>{line.sourceKind === "REFUND" ? "退款冲回" : "律师费收款"}</td><td className="font-mono">{line.sourceOccurredAt.slice(0, 10)}</td><td className="font-mono">{mask(line.sourcePaymentId)}</td><td className="font-mono">{line.refundLinkId ? mask(line.refundLinkId) : "—"}</td><td className="text-right font-mono">{money(line.grossAmount)}</td><td className="text-right font-mono">{money(line.channelAmount)}</td><td className="text-right font-mono">{money(line.firmAmount)}</td><td className="text-right font-mono">{money(line.sourceAmount)}</td><td className="text-right font-mono">{money(line.handlingAmount)}</td><td className="text-right font-mono">{money(line.coAmount)}</td></tr>)}</tbody></table></div>
+      </div>)}
     </div>
   );
 }
 
+function ProjectMetric({ label, value, missing }: { label: string; value: string | null; missing?: string }) {
+  return <div className="rounded-[8px] border border-[var(--bd-hair)] bg-[var(--bg-sunken)] px-3 py-2.5"><div className="text-[11.5px] text-[var(--t-muted)]">{label}</div><div className="mt-1 font-mono text-[13px] font-[600]">{value === null ? missing : money(value)}</div></div>;
+}
+
 function FirmCard({ view }: { view: InternalLedgerView }) {
   if (!view.firm) return <EmptyTable text="本批次没有律所经营成果" />;
-  const values = [
+  const values: Array<[string, string | null]> = [
     ["律师费收入", view.firm.feeRevenue],
     ["渠道成本", view.firm.channelAmount],
     ["律所留存", view.firm.firmAmount],
     ["律师分配", view.firm.lawyerAmount],
     ["经营成果", view.firm.operatingResult]
   ];
-  return <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">{values.map(([label, value], index) => <div key={label} className={index === values.length - 1 ? "rounded-[10px] border border-[var(--teal-line)] bg-[var(--teal-soft)] p-3.5" : "rounded-[10px] border border-[var(--bd-hair)] bg-[var(--bg-sunken)] p-3.5"}><div className="text-[11.5px] text-[var(--t-muted)]">{label}</div><div className="mt-2 font-mono text-[18px] font-[650] tracking-tight">{money(value)}</div></div>)}</div>;
+  const costs = view.firm.costBreakdown;
+  return <div className="space-y-3">
+    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">{values.map(([label, value], index) => <div key={label} className={index === values.length - 1 ? "rounded-[10px] border border-[var(--teal-line)] bg-[var(--teal-soft)] p-3.5" : "rounded-[10px] border border-[var(--bd-hair)] bg-[var(--bg-sunken)] p-3.5"}><div className="text-[11.5px] text-[var(--t-muted)]">{label}</div><div className="mt-2 font-mono text-[18px] font-[650] tracking-tight">{money(value)}</div></div>)}</div>
+    {costs ? <div className="rounded-[10px] border border-[var(--bd-hair)] px-3.5 py-3"><h3 className="text-[12px] font-[650]">律所实际承担成本</h3><div className="mt-2 grid grid-cols-2 gap-2 text-[12px] sm:grid-cols-4">{[["工资", costs.salary], ["社保", costs.social], ["公积金", costs.fund], ["房租", costs.rent], ["办公", costs.office], ["流转税费", costs.turnoverTax], ["其他", costs.other]].map(([label, amount]) => <div key={label} className="flex justify-between gap-2"><span className="text-[var(--t-muted)]">{label}</span><span className="font-mono">{money(amount)}</span></div>)}</div></div> : <p className="text-[11.5px] text-[var(--t-muted)]">成本构成待财务核对。</p>}
+  </div>;
 }
 
 function EmptyTable({ text }: { text: string }) {

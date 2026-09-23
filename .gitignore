@@ -55,3 +55,4 @@ outputs/
 
 # Local test and browser artifacts are not release content
 output/
+/.worktrees/

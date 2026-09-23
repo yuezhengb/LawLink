@@ -1,4 +1,6 @@
 import { Prisma } from "@prisma/client";
+import { createHash } from "node:crypto";
+import PizZip from "pizzip";
 import { describe, expect, it, vi } from "vitest";
 import { makeSyntheticFinanceFixture } from "@/tests/fixtures/finance-synthetic";
 import { parseFinanceWorkbook } from "@/lib/finance/import-parser";
@@ -8,10 +10,7 @@ import { buildFirmOperatingResult, buildPersonalDoubleBalance } from "@/lib/fina
 import { commitFinanceImport } from "@/server/finance/internal-imports";
 import { getInternalFinanceSummary } from "@/server/finance/internal-reports";
 import { generateMonthlyClose, getMonthlyCloseStatus } from "@/server/finance/monthly-close";
-
-vi.mock("@/server/finance/internal-export", () => ({
-  buildFinanceWorkbook: vi.fn().mockResolvedValue(Buffer.from("synthetic-workbook"))
-}));
+import { currentAllocationSourceHash } from "@/server/finance/internal-allocation";
 
 const financeActor = { id: "synthetic-user-2", role: "FINANCE" } as const;
 
@@ -85,9 +84,21 @@ describe("内部财务合成闭环验收", () => {
       coAmount: allocation.co,
       matter: { id: fixture.matter.id, internalCode: fixture.matter.internalCode, title: fixture.matter.title, primaryClient: { id: fixture.client.id } },
       targetUser: { id: fixture.users[0].id, name: fixture.users[0].name },
-      payment: { id: fixture.confirmedPayment.id, occurredAt: new Date("2026-08-01T00:00:00+08:00") }
+      payment: { id: fixture.confirmedPayment.id, occurredAt: new Date("2026-08-01T00:00:00+08:00") },
+      recipients: [
+        { id: "synthetic-recipient-source", userId: fixture.users[0].id, role: "SOURCE", shareRate: new Prisma.Decimal("1"), amount: allocation.source, user: { id: fixture.users[0].id, name: fixture.users[0].name } },
+        { id: "synthetic-recipient-handling", userId: fixture.users[0].id, role: "HANDLING", shareRate: new Prisma.Decimal("1"), amount: allocation.handling, user: { id: fixture.users[0].id, name: fixture.users[0].name } },
+        { id: "synthetic-recipient-co", userId: fixture.users[1].id, role: "CO", shareRate: new Prisma.Decimal("1"), amount: allocation.co, user: { id: fixture.users[1].id, name: fixture.users[1].name } }
+      ]
     };
-    const reportDb = { financeCalculationRun: { findMany: vi.fn().mockResolvedValue([{ id: "synthetic-run-1", status: "COMMITTED", periodStart: new Date("2026-08-01T00:00:00+08:00"), periodEnd: new Date("2026-09-01T00:00:00+08:00"), allocationLines: [reportLine] }]) } };
+    const reportDb = {
+      financeCalculationRun: { findMany: vi.fn().mockResolvedValue([{ id: "synthetic-run-1", status: "COMMITTED", sourceHash: "synthetic-source-hash", periodStart: new Date("2026-08-01T00:00:00+08:00"), periodEnd: new Date("2026-09-01T00:00:00+08:00"), allocationLines: [reportLine] }]) },
+      financeFirmPeriodSnapshot: { findUnique: vi.fn().mockResolvedValue(null) },
+      billing: { findMany: vi.fn().mockResolvedValue([]) },
+      invoiceRequest: { findMany: vi.fn().mockResolvedValue([]) },
+      invoiceAdjustment: { findMany: vi.fn().mockResolvedValue([]) },
+      payment: { findMany: vi.fn().mockResolvedValue([]) }
+    };
     const summary = await getInternalFinanceSummary({ start: new Date("2026-08-01T00:00:00+08:00"), end: new Date("2026-09-01T00:00:00+08:00"), groupBy: "ALL" }, { db: reportDb as never, actor: financeActor });
     expect(summary.calculationRunId).toBe("synthetic-run-1");
     expect(summary.persons[0].calculationRunId).toBe(summary.firm.calculationRunId);
@@ -95,23 +106,69 @@ describe("内部财务合成闭环验收", () => {
     expect(summary.projects[0].lines).toHaveLength(1);
 
     const closeTx = {
-      financeMonthlyClose: { upsert: vi.fn().mockResolvedValue({ id: "synthetic-close-1" }) },
+      financeMonthlyClose: { create: vi.fn().mockResolvedValue({ id: "synthetic-close-1" }), findFirst: vi.fn().mockResolvedValue(null) },
       financeArtifact: { create: vi.fn().mockImplementation(({ data }: { data: { id?: string; runId: string; sha256: string } }) => Promise.resolve({ id: data.id ?? `artifact-${data.runId}-${data.sha256.slice(0, 4)}` })) },
       auditLog: { create: vi.fn().mockResolvedValue({ id: "synthetic-audit-close" }) }
     };
-    const closeDb = {
-      financeImportBatch: { findMany: vi.fn().mockResolvedValue([{ kind: "BANK_STATEMENT", rowCount: 1 }]) },
+    const start = new Date("2026-08-01T00:00:00+08:00");
+    const end = new Date("2026-09-01T00:00:00+08:00");
+    const bankBatch = { id: "synthetic-batch-1", kind: "BANK_STATEMENT", rowCount: 1, periodStart: start, periodEnd: end };
+    const closeDb: Record<string, unknown> = {
+      financeImportBatch: { findMany: vi.fn().mockResolvedValue([bankBatch]) },
       financeReconciliationCase: { count: vi.fn().mockResolvedValue(0) },
-      financeCalculationRun: { findFirst: vi.fn().mockResolvedValue({ id: "synthetic-run-1", sourceHash: "synthetic-source-hash", summary: {} }) },
-      financeMonthlyClose: { findUnique: vi.fn().mockResolvedValue(null) },
+      financeCalculationRun: { findFirst: vi.fn(), findUnique: vi.fn(), findMany: vi.fn() },
+      financeMonthlyClose: { findUnique: vi.fn().mockResolvedValue(null), findFirst: vi.fn().mockResolvedValue(null) },
+      financePeriodCoverage: { findUnique: vi.fn().mockResolvedValue({ details: {
+        bankAccounts: [{ alias: "合成基本户", batchIds: [bankBatch.id] }],
+        payrollBatchIds: [], noPayrollReason: "合成验收不录入工资",
+        rosterBatchIds: [], noRosterReason: "合成验收不更新花名册",
+        externalBatchIds: [], noExternalReason: "合成验收不导入外部三表"
+      } }) },
+      financeSourceRow: { findMany: vi.fn().mockResolvedValue([]) },
+      financeRefundLink: { findMany: vi.fn().mockResolvedValue([]) },
+      financeMatterProfile: { findMany: vi.fn().mockResolvedValue([]) },
+      commissionPlan: { findMany: vi.fn().mockResolvedValue([]) },
+      financeRuleVersion: { findMany: vi.fn().mockResolvedValue([]), findFirst: vi.fn().mockResolvedValue(null) },
+      user: { findMany: vi.fn().mockResolvedValue([]) },
+      financePayrollFact: { findMany: vi.fn().mockResolvedValue([]) },
+      financePersonLedgerEntry: { findMany: vi.fn().mockResolvedValue([]) },
+      financeOpeningBalance: { findMany: vi.fn().mockResolvedValue([]) },
+      financeOperatingCost: { findMany: vi.fn().mockResolvedValue([]) },
+      financePartnerTaxRecord: { findMany: vi.fn().mockResolvedValue([]) },
+      financeCapitalFlow: { findMany: vi.fn().mockResolvedValue([]) },
+      financeAdjustment: { findMany: vi.fn().mockResolvedValue([]) },
+      financeImportRecord: { findMany: vi.fn().mockResolvedValue([]) },
+      financeFirmPeriodSnapshot: { findUnique: vi.fn().mockResolvedValue({
+        operatingResult: new Prisma.Decimal("36450.00"), firmSalaryCost: new Prisma.Decimal("0"), firmSocialCost: new Prisma.Decimal("0"), firmFundCost: new Prisma.Decimal("0"), rentCost: new Prisma.Decimal("0"), officeCost: new Prisma.Decimal("0"), turnoverTaxCost: new Prisma.Decimal("0"), otherCost: new Prisma.Decimal("0")
+      }) },
+      financePersonPeriodSnapshot: { findMany: vi.fn().mockResolvedValue([]) },
       financeArtifact: { findMany: vi.fn().mockResolvedValue([]) },
+      payment: { findMany: vi.fn().mockResolvedValue([]) },
+      billing: { findMany: vi.fn().mockResolvedValue([]) },
+      invoiceRequest: { findMany: vi.fn().mockResolvedValue([]) },
+      invoiceAdjustment: { findMany: vi.fn().mockResolvedValue([]) },
       $transaction: vi.fn(async (callback: (value: typeof closeTx) => Promise<unknown>) => callback(closeTx))
     };
+    const currentSourceHash = await currentAllocationSourceHash({ periodStart: "2026-08-01", periodEnd: "2026-09-01" }, { db: closeDb as never });
+    const committedRun = {
+      id: "synthetic-run-1", status: "COMMITTED", periodStart: start, periodEnd: end, sourceHash: currentSourceHash,
+      summary: { allocationVersion: 2, snapshotVersion: "personal-v1", blockingIssues: [], lineCount: 1, recipientCount: 3, paymentCount: 1, refundCount: 0, personSnapshotCount: 0, firmSnapshotCount: 1, missingPayrollCount: 0, splitErrorCount: 0 },
+      allocationLines: [reportLine], personPeriodSnapshots: [], firmPeriodSnapshot: { id: "synthetic-firm-snapshot" }
+    };
+    const monthEnd = end.getTime();
+    (closeDb.financeCalculationRun as { findFirst: ReturnType<typeof vi.fn> }).findFirst.mockImplementation(({ where }: { where: { periodEnd?: Date } }) => Promise.resolve(where.periodEnd?.getTime() === monthEnd ? committedRun : null));
+    (closeDb.financeCalculationRun as { findUnique: ReturnType<typeof vi.fn> }).findUnique.mockResolvedValue(committedRun);
+    (closeDb.financeCalculationRun as { findMany: ReturnType<typeof vi.fn> }).findMany.mockResolvedValue([committedRun]);
     const status = await getMonthlyCloseStatus("2026-08", { db: closeDb as never, actor: financeActor });
-    expect(status).toMatchObject({ ready: true, runId: "synthetic-run-1", sourceHash: "synthetic-source-hash" });
-    const artifacts = await generateMonthlyClose("2026-08", { db: closeDb as never, actor: financeActor, storage: { writeFile: vi.fn().mockResolvedValue("finance-artifacts/synthetic.bin"), readFile: vi.fn(), deleteFile: vi.fn() } });
+    expect(status).toMatchObject({ ready: true, runId: "synthetic-run-1", sourceHash: currentSourceHash });
+    const storedBytes: Buffer[] = [];
+    const writeFile = vi.fn(async (_folder: string, bytes: Buffer) => { storedBytes.push(Buffer.from(bytes)); return `finance-artifacts/synthetic-${storedBytes.length}.bin`; });
+    const artifacts = await generateMonthlyClose("2026-08", { db: closeDb as never, actor: financeActor, storage: { writeFile, readFile: vi.fn(), deleteFile: vi.fn() } });
     expect(artifacts).toHaveLength(5);
-    expect(closeTx.financeMonthlyClose.upsert).toHaveBeenCalledWith(expect.objectContaining({ create: expect.objectContaining({ runId: "synthetic-run-1", sourceHash: "synthetic-source-hash" }) }));
+    expect(new Set(storedBytes.slice(0, 4).map((bytes) => createHash("sha256").update(bytes).digest("hex"))).size).toBe(4);
+    const packageZip = new PizZip(storedBytes[4]);
+    expect(packageZip.file(/\.xlsx$/)).toHaveLength(4);
+    expect(closeTx.financeMonthlyClose.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ revision: 1, runId: "synthetic-run-1", sourceHash: currentSourceHash }) }));
     expect(closeTx.financeArtifact.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ runId: "synthetic-run-1" }) }));
     expect(fixture.pendingReceipt.confirmState).toBe("PENDING");
   });

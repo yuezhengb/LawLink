@@ -41,4 +41,10 @@ describe("审计动作标签", () => {
     expect(auditActionLabel("USER_TOTP_REBIND_RESET")).toBe("用户 · 二次验证 · 重新绑定 · 重置");
     expect(auditTargetLabel("ArchiveBorrowRequest")).toBe("案卷借阅申请");
   });
+
+  it("律所财务分配的审计事件和对象有中文标签", () => {
+    expect(auditActionLabel("FINANCE_INTERNAL_ALLOCATION_COMMIT")).toBe("财务 · 内账 · 分配 · 提交");
+    expect(auditActionLabel("FINANCE_INTERNAL_REFUND_LINK")).toBe("财务 · 内账 · 退款 · 关联");
+    expect(auditTargetLabel("FinanceAllocationRecipient")).toBe("律师分配明细");
+  });
 });

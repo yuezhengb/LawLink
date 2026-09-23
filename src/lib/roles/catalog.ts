@@ -136,6 +136,6 @@ export function canExecuteFinance(user: RoleUser, key: "finance.correct" | "fina
 }
 
 /** 经营财务写入资格；系统管理员身份和业务管理权不能替代显式授权。 */
-export function canManageInternalFinance(user: RoleUser, key: "finance.rules" | "finance.adjust") {
+export function canManageInternalFinance(user: RoleUser, key: "finance.rules" | "finance.adjust" | "finance.export") {
   return user.role === "FINANCE" || (user.role === "CUSTOM" && scopeFor(user, key) === "ALL");
 }

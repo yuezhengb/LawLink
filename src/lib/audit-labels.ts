@@ -15,7 +15,29 @@ const targetLabels: Record<string, string> = {
   ArchiveBorrowRequest: "案卷借阅申请", CommissionSettlement: "分成结算", DeadlineRule: "期限规则",
   FeeEntryList: "收付记录列表", FinanceCorrection: "财务更正", Holiday: "放假安排",
   Payment: "实收", Receivable: "应收", ReminderDelivery: "提醒送达台账",
-  UserIdentityDocument: "人员证件资料"
+  UserIdentityDocument: "人员证件资料",
+  FinanceAdjustment: "财务调整",
+  FinanceArtifact: "财务交付文件",
+  FinanceCalculationRun: "财务计算批次",
+  FinanceCapitalFlow: "合伙人资本流水",
+  FinanceImportBatch: "财务导入批次",
+  FinanceMatterProfile: "案件财务画像",
+  FinanceMonthlyClose: "月结",
+  FinancePartnerTaxRecord: "合伙人税款记录",
+  FinancePayrollFact: "工资事实",
+  FinanceReconciliationCase: "银行流水核对",
+  FinanceRefundLink: "收款退款关联",
+  FinanceRuleVersion: "财务规则版本",
+  FinanceWorkbook: "财务工作簿",
+  FinanceAllocationRecipient: "律师分配明细",
+  FinancePayrollFactRevision: "工资事实修订",
+  FinanceOpeningBalance: "个人财务期初",
+  FinancePersonPeriodSnapshot: "个人月度财务快照",
+  FinanceFirmPeriodSnapshot: "律所月度经营快照",
+  FinanceOperatingCost: "律所经营成本",
+  FinanceImportRecord: "财务资料记录",
+  FinancePeriodCoverage: "财务来源覆盖确认",
+  FinancePersonLedgerEntry: "个人财务台账"
 };
 const words: Record<string, string> = {
   BUILTIN: "内置", ROLE: "角色", PRESENTATION: "显示资料", DEFINITION: "定义",
@@ -51,7 +73,7 @@ const words: Record<string, string> = {
   // 第七轮体检：auditActionLabel 要求 action 的每个词都已登记，缺一个整条即降级为
   // 「其他操作（详见技术详情）」。全仓 199 个 action 中 48 个命中该降级，其中含
   // 证件号/电话明文查看、财务更正、二次验证变更等敏感操作。以下为一次补齐的清单。
-  ADJUST: "调整", ALLOCATION: "核销", AMENDMENT: "补充协议", BORROW: "借阅", BUNDLE: "卷宗包",
+  ADJUST: "调整", ALLOCATION: "分配", AMENDMENT: "补充协议", BORROW: "借阅", BUNDLE: "卷宗包",
   CANCEL: "取消", CHECKOUT: "取件", CONDITION: "条件", CONFIRM: "确认", CONFIRMED: "已确认",
   CORRECTION: "更正", DESKTOP: "桌面连接器", DISABLE: "停用", DRAFT: "草稿", ENABLE: "启用",
   ENCRYPT: "加密", ENFORCED: "强制要求", FETCH: "拉取", FINANCE: "财务", FROM: "来自",
@@ -60,7 +82,13 @@ const words: Record<string, string> = {
   NOTIFY: "通知", PHONE: "电话", PHOTO: "照片", POLICY: "制度", POST: "事后",
   REBIND: "重新绑定", RECEIVABLE: "应收", RECIPIENT: "接收人", RENDER: "渲染", RESET: "重置",
   RETURN: "归还", REVEAL: "查看明文", RULE: "规则", SAVED: "已保存", SCHEDULE: "日程",
-  SIGN: "签署", TEXT: "正文", TOTP: "二次验证", VERSION: "版本"
+  SIGN: "签署", TEXT: "正文", TOTP: "二次验证", VERSION: "版本",
+  INTERNAL: "内账", ADJUSTMENT: "调整", REVERSE: "冲销", COMMIT: "提交",
+  ARTIFACT: "交付文件", CAPITAL: "资本", SOURCE: "来源", MATERIALIZE: "生成批次",
+  MONTHLY: "月度", PARTNER: "合伙人", TAX: "税款", PAYROLL: "工资", UPSERT: "保存",
+  RECONCILIATION: "流水核对", DECISION: "裁定", REFUND: "退款", PUBLISH: "发布",
+  OPENING: "期初余额", OPERATING: "经营", PERSON: "人员", BALANCE: "余额",
+  COST: "成本", COVERAGE: "覆盖", RECORD: "记录", RESOLVE: "复核"
 };
 export function auditActionLabel(code: string): string {
   const parts = code.split("_");

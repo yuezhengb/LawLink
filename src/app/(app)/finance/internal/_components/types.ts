@@ -31,6 +31,9 @@ export type LedgerPerson = {
 
 export type LedgerProjectLine = {
   sourcePaymentId: string;
+  sourceKind: "PAYMENT" | "REFUND";
+  refundLinkId: string | null;
+  sourceOccurredAt: string;
   grossAmount: string;
   channelAmount: string;
   firmAmount: string;
@@ -45,6 +48,11 @@ export type LedgerProject = {
   matterCode: string;
   matterTitle: string;
   clientReference: string | null;
+  claimAmount: string | null;
+  signedContractAmount: string | null;
+  issuedInvoiceNetAmount: string;
+  confirmedNetReceiptAmount: string;
+  periodAllocationAmount: string;
   lines: LedgerProjectLine[];
 };
 
@@ -54,7 +62,8 @@ export type LedgerFirm = {
   channelAmount: string;
   firmAmount: string;
   lawyerAmount: string;
-  operatingResult: string;
+  operatingResult: string | null;
+  costBreakdown: { salary: string; social: string; fund: string; rent: string; office: string; turnoverTax: string; other: string } | null;
 };
 
 export type PersonalBalance = {
@@ -79,6 +88,7 @@ export type ReconciliationItem = ReconciliationQueue["items"][number];
 export type ReconciliationWorkspaceQueue = {
   items: Array<{
     id: string;
+    sourceRowId: string;
     status: FinanceMatchStatus;
     row: FinanceNormalizedRow;
     suggestions: FinanceMatchSuggestion[];
@@ -124,8 +134,11 @@ export type MonthlyCloseAdjustment = {
 
 export type MonthlyCloseWorkspaceData = {
   period: string;
+  sourceBatches: Array<{ id: string; kind: string; fileName: string; rowCount: number }>;
+  coverageDetails: import("@/lib/finance/internal-types").FinancePeriodCoverageInput | null;
   status: {
     ready: boolean;
+    coverageConfirmed: boolean;
     sourceFiles: number;
     sourceKinds: string[];
     transactionCount: number;

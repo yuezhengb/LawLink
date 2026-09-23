@@ -31,6 +31,7 @@ function sourceRow(overrides: Record<string, unknown> = {}) {
 
 function mockDeps() {
   const tx = {
+    $queryRaw: vi.fn().mockResolvedValue([]),
     financeReconciliationCase: {
       findUnique: vi.fn(),
       findFirst: vi.fn(),
@@ -47,6 +48,7 @@ function mockDeps() {
     },
     financeRefundLink: {
       findFirst: vi.fn(),
+      findMany: vi.fn().mockResolvedValue([]),
       create: vi.fn().mockResolvedValue({ id: "refund-link-1" })
     },
     auditLog: {
@@ -99,6 +101,25 @@ describe("内部财务对账与认领", () => {
     );
   });
 
+  it("退款来源行只显示已登记且未关联的冲销付款，关联建议永不自动确认", async () => {
+    const { db, deps } = mockDeps();
+    db.financeReconciliationCase.findMany.mockResolvedValue([{
+      id: "refund-case", status: "UNRESOLVED", batchId: "batch-1",
+      sourceRow: sourceRow({ id: "refund-source", amount: new Prisma.Decimal("-80.00"), direction: "DEBIT" })
+    }]);
+    db.payment.findMany.mockResolvedValue([{
+      id: "refund-payment", occurredAt: new Date("2026-02-01T00:00:00+08:00"),
+      refundedAmount: new Prisma.Decimal("100.00"), financeRefundLinks: [{ amount: new Prisma.Decimal("20.00") }],
+      matter: { internalCode: "SYN-REFUND-1" }
+    }]);
+
+    const result = await listFinanceReconciliationCases({ batchId: "batch-1" }, deps);
+
+    expect(result.items[0]).toMatchObject({ id: "refund-case", sourceRowId: "refund-source" });
+    expect(result.items[0].suggestions[0]).toMatchObject({ paymentId: "refund-payment", autoConfirm: false, candidateSummary: expect.stringContaining("SYN-REFUND-1") });
+    expect(db.payment.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ refundedAmount: { gt: 0 } }) }));
+  });
+
   it("已确认案例重复提交同一决定时幂等，不重复写决定", async () => {
     const { tx, deps } = mockDeps();
     tx.financeReconciliationCase.findUnique.mockResolvedValue({
@@ -143,5 +164,46 @@ describe("内部财务对账与认领", () => {
       linkFinanceRefund({ sourceRowId: "source-row-1", paymentId: "payment-1", amount: "10.00", reason: "合成退款" }, deps)
     ).rejects.toThrow("已有有效退款关联");
     expect(tx.financeRefundLink.create).not.toHaveBeenCalled();
+  });
+
+  it("退款关联金额须等于银行退款行且已在收款账确认，再完成案件关联", async () => {
+    const { tx, deps } = mockDeps();
+    tx.financeSourceRow.findUnique.mockResolvedValue({
+      ...sourceRow({ amount: new Prisma.Decimal("-10.00"), direction: "DEBIT" }),
+      reconciliationCase: { id: "case-refund", status: "UNRESOLVED", paymentId: null }
+    });
+    tx.payment.findFirst.mockResolvedValue({ id: "payment-1", matterId: "matter-1", moneyKind: "LAWYER_FEE", amount: new Prisma.Decimal("100.00"), refundedAmount: new Prisma.Decimal("10.00") });
+
+    const result = await linkFinanceRefund({ sourceRowId: "source-row-1", paymentId: "payment-1", amount: "10.00", reason: "合成退款" }, deps);
+
+    expect(result).toEqual({ linkId: "refund-link-1" });
+    expect(tx.financeClaimDecision.create).toHaveBeenCalledWith({ data: expect.objectContaining({ caseId: "case-refund", decision: "CONFIRM", paymentId: "payment-1" }) });
+    expect(tx.financeReconciliationCase.update).toHaveBeenCalledWith({ where: { id: "case-refund" }, data: expect.objectContaining({ status: "CONFIRMED", paymentId: "payment-1" }) });
+  });
+
+  it("未登记的退款与仅部分关联的银行退款行均不能进入分配", async () => {
+    const { tx, deps } = mockDeps();
+    tx.financeSourceRow.findUnique.mockResolvedValue({
+      ...sourceRow({ amount: new Prisma.Decimal("-10.00"), direction: "DEBIT" }),
+      reconciliationCase: { id: "case-refund", status: "UNRESOLVED", paymentId: null }
+    });
+    tx.payment.findFirst.mockResolvedValue({ id: "payment-1", matterId: "matter-1", moneyKind: "LAWYER_FEE", amount: new Prisma.Decimal("100.00"), refundedAmount: new Prisma.Decimal("5.00") });
+
+    await expect(linkFinanceRefund({ sourceRowId: "source-row-1", paymentId: "payment-1", amount: "10.00", reason: "合成退款" }, deps)).rejects.toThrow("尚未完整登记退款冲销");
+    await expect(linkFinanceRefund({ sourceRowId: "source-row-1", paymentId: "payment-1", amount: "5.00", reason: "部分关联" }, deps)).rejects.toThrow("必须等于退款来源行金额");
+    expect(tx.financeRefundLink.create).not.toHaveBeenCalled();
+  });
+
+  it("重复提交完全相同的退款关联返回已有凭证，不重复写决定", async () => {
+    const { tx, deps } = mockDeps();
+    tx.financeSourceRow.findUnique.mockResolvedValue({
+      ...sourceRow({ amount: new Prisma.Decimal("-10.00"), direction: "DEBIT" }),
+      reconciliationCase: { id: "case-refund", status: "CONFIRMED", paymentId: "payment-1" }
+    });
+    tx.financeRefundLink.findFirst.mockResolvedValue({ id: "refund-link-existing", active: true, paymentId: "payment-1", amount: new Prisma.Decimal("10.00") });
+
+    await expect(linkFinanceRefund({ sourceRowId: "source-row-1", paymentId: "payment-1", amount: "10.00", reason: "重试" }, deps)).resolves.toEqual({ linkId: "refund-link-existing" });
+    expect(tx.financeRefundLink.create).not.toHaveBeenCalled();
+    expect(tx.financeClaimDecision.create).not.toHaveBeenCalled();
   });
 });
