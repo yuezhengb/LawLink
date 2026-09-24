@@ -396,14 +396,29 @@ async function readXlsx(bytes: Buffer): Promise<Matrix> {
   await workbook.xlsx.load(bytes as unknown as ArrayBuffer);
   const sheet = workbook.worksheets[0];
   if (!sheet) return [];
-  const matrix: Matrix = [];
-  for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
-    const row = sheet.getRow(rowNumber);
-    const values: string[] = [];
-    for (let columnNumber = 1; columnNumber <= sheet.columnCount; columnNumber += 1) {
-      values.push(cellToText(row.getCell(columnNumber).value));
-    }
-    matrix.push(values);
+  const rows = new Map<number, Map<number, string>>();
+  let maxRowNumber = 0;
+  let maxColumnNumber = 0;
+
+  // ExcelJS columnCount can be inflated by formatting-only cells. Iterate only
+  // through populated cells, but retain original row numbers for audit errors.
+  sheet.eachRow({ includeEmpty: false }, (row) => {
+    const values = new Map<number, string>();
+    row.eachCell({ includeEmpty: false }, (cell, columnNumber) => {
+      const value = cellToText(cell.value);
+      if (!value) return;
+      values.set(columnNumber, value);
+      maxColumnNumber = Math.max(maxColumnNumber, columnNumber);
+    });
+    if (values.size === 0) return;
+    rows.set(row.number, values);
+    maxRowNumber = Math.max(maxRowNumber, row.number);
+  });
+
+  if (maxRowNumber === 0 || maxColumnNumber === 0) return [];
+  const matrix: Matrix = Array.from({ length: maxRowNumber }, () => Array(maxColumnNumber).fill(""));
+  for (const [rowNumber, values] of rows) {
+    for (const [columnNumber, value] of values) matrix[rowNumber - 1][columnNumber - 1] = value;
   }
   return matrix;
 }

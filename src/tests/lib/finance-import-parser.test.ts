@@ -2,7 +2,8 @@ import ExcelJS from "exceljs";
 import { describe, expect, it } from "vitest";
 import {
   normalizeFinanceRow,
-  parseFinanceWorkbook
+  parseFinanceWorkbook,
+  readFinanceMatrix
 } from "@/lib/finance/import-parser";
 import { parseFinanceSource } from "@/lib/finance/finance-source-parser";
 
@@ -13,7 +14,26 @@ async function xlsxBuffer(rows: unknown[][]): Promise<Buffer> {
   return Buffer.from(await workbook.xlsx.writeBuffer());
 }
 
+async function wideFormattedXlsxBuffer(): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet("Sheet1");
+  sheet.addRow(["日期", "金额"]);
+  sheet.addRow(["2026-08-01", "100.00"]);
+  // Some source workbooks have formatting thousands of columns to the right
+  // without any data. The parser must not scan that empty formatted tail.
+  sheet.getCell(1, 16373).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEFEFEF" } };
+  return Buffer.from(await workbook.xlsx.writeBuffer());
+}
+
 describe("财务来源文件解析", () => {
+  it("忽略仅有格式的超宽空尾列", async () => {
+    const result = await readFinanceMatrix(await wideFormattedXlsxBuffer(), "工资表.xlsx");
+
+    expect(result.errors).toEqual([]);
+    expect(result.matrix[0]).toEqual(["日期", "金额"]);
+    expect(result.matrix[1]).toEqual(["2026-08-01", "100.00"]);
+  });
+
   it("识别借方/贷方并统一为有符号金额", async () => {
     const result = await parseFinanceWorkbook(
       await xlsxBuffer([
@@ -113,6 +133,21 @@ describe("财务来源文件解析", () => {
       kind: "ROSTER",
       asOfDay: "2026-08-31",
       rows: [{ sourceRowNumber: 2, displayName: "合成人员甲", roleLabel: "律师" }],
+      errors: []
+    });
+  });
+
+  it("识别律所花名册中的律所职位列", async () => {
+    const result = await parseFinanceSource(
+      Buffer.from("姓名,律所职位\n合成人员乙,律师", "utf8"),
+      "synthetic-roster-position.csv",
+      "ROSTER",
+      { asOfDay: "2026-08-31" }
+    );
+
+    expect(result).toMatchObject({
+      kind: "ROSTER",
+      rows: [{ displayName: "合成人员乙", roleLabel: "律师" }],
       errors: []
     });
   });
