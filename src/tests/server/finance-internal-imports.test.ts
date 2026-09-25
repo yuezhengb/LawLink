@@ -1,6 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import ExcelJS from "exceljs";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeSyntheticFinanceFixture } from "@/tests/fixtures/finance-synthetic";
 import type { FinanceNormalizedRow } from "@/lib/finance/internal-types";
+import { financeTypedRecordFingerprint, rowFingerprint } from "@/lib/finance/source-fingerprint";
+import type { FinancePreprocessedUpload } from "@/server/finance/finance-preprocessor-client";
 import {
   canReadFinanceImport,
   commitFinanceImport,
@@ -8,6 +11,8 @@ import {
   previewFinanceImport,
   type FinanceImportDependencies
 } from "@/server/finance/internal-imports";
+
+afterEach(() => vi.unstubAllEnvs());
 
 function formDataFor(fileName: string): FormData {
   const fixture = makeSyntheticFinanceFixture();
@@ -28,6 +33,16 @@ async function bytesFor(fileName: string): Promise<Buffer> {
   return Buffer.from(await file.arrayBuffer());
 }
 
+async function twoSheetBankBytes(): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook();
+  for (const [name, day, amount] of [["银行A", "2026-08-01", "100"], ["银行B", "2026-08-02", "200"]]) {
+    const sheet = workbook.addWorksheet(name);
+    sheet.addRow(["日期", "对方户名", "贷方发生额"]);
+    sheet.addRow([day, "合成客户", amount]);
+  }
+  return Buffer.from(await workbook.xlsx.writeBuffer());
+}
+
 function transactionDb() {
   const tx = {
     financeImportBatch: {
@@ -44,7 +59,8 @@ function transactionDb() {
       createMany: vi.fn().mockResolvedValue({ count: 1 })
     },
     financeImportRecord: {
-      createMany: vi.fn().mockResolvedValue({ count: 1 })
+      createMany: vi.fn().mockResolvedValue({ count: 1 }),
+      findMany: vi.fn().mockResolvedValue([])
     },
     auditLog: {
       create: vi.fn().mockResolvedValue({ id: "audit-new" })
@@ -53,6 +69,12 @@ function transactionDb() {
   const db = {
     financeImportBatch: {
       findUnique: vi.fn()
+    },
+    financeSourceRow: {
+      findMany: vi.fn().mockResolvedValue([])
+    },
+    financeImportRecord: {
+      findMany: vi.fn().mockResolvedValue([])
     },
     $transaction: vi.fn(async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx))
   };
@@ -89,6 +111,39 @@ describe("内部财务资料导入", () => {
     expect((result.rows[0] as FinanceNormalizedRow).accountMasked).toBe("****0001");
     expect(db.financeImportBatch.findUnique).not.toHaveBeenCalled();
     expect(storage.writeFile).not.toHaveBeenCalled();
+  });
+
+  it("工资预览对姓名真实脱敏", async () => {
+    const form = new FormData();
+    form.set("kind", "PAYROLL");
+    form.set("file", new File([
+      "月份,姓名,申报工资,实际支付,自担社保\n2026-08,合成人员甲,15000.00,12000.00,800.00"
+    ], "synthetic-payroll.csv", { type: "text/csv" }));
+    const { db } = transactionDb();
+
+    const preview = await previewFinanceImport(form, depsFor(db, storageMock()));
+
+    expect(preview.rows).toMatchObject([{ displayName: "合****" }]);
+    expect(JSON.stringify(preview)).not.toContain("合成人员甲");
+  });
+
+  it("花名册重复预检使用截至日期推导出的账期", async () => {
+    vi.stubEnv("STORAGE_ENCRYPTION_KEY", Buffer.alloc(32, 7).toString("base64"));
+    const { db } = transactionDb();
+    db.financeImportBatch.findUnique.mockResolvedValue(null);
+    const storage = storageMock();
+    const bytes = Buffer.from("姓名,岗位\n合成人员甲,律师", "utf8");
+
+    await commitFinanceImport({
+      fileName: "synthetic-roster.csv",
+      kind: "ROSTER",
+      bytes,
+      asOfDay: "2026-08-31"
+    }, depsFor(db, storage));
+
+    expect(db.financeImportRecord.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ kind: "ROSTER", period: { in: ["2026-08"] } })
+    }));
   });
 
   it("同一 sha256 的已提交批次幂等返回原批次", async () => {
@@ -129,7 +184,150 @@ describe("内部财务资料导入", () => {
     expect(storage.deleteFile).toHaveBeenCalledWith("finance-imports/202609/source.bin");
   });
 
+  it("PDF 预览保留页码表格来源，并把无法结构化的页标为不可提交候选", async () => {
+    const { db } = transactionDb();
+    const storage = storageMock();
+    const document = {
+      version: 1 as const,
+      pages: [
+        { pageNumber: 1, extraction: "TEXT_TABLE" as const, tables: [[ ["日期", "贷方发生额"], ["2026-08-01", "100.00"] ]], ocrWords: [] },
+        { pageNumber: 2, extraction: "OCR_CANDIDATE" as const, tables: [], ocrWords: [{ text: "合成候选", confidence: 70, bbox: [1, 2, 3, 4] as [number, number, number, number] }] }
+      ]
+    };
+    const preprocess = vi.fn().mockResolvedValue({ kind: "PDF", document } satisfies FinancePreprocessedUpload);
+    const form = new FormData();
+    form.set("kind", "BANK_STATEMENT");
+    form.set("file", new File(["synthetic-pdf"], "synthetic.pdf", { type: "application/pdf" }));
+
+    const result = await previewFinanceImport(form, { ...depsFor(db, storage), preprocess });
+
+    expect(result.rows).toMatchObject([{ sourceSheet: "PDF第1页-表1", sourceRowNumber: 2, amount: "100.00" }]);
+    expect(result.pdfCandidates).toEqual([{ pageNumber: 2, extraction: "OCR_CANDIDATE", wordCount: 1 }]);
+    expect(result.canCommitStructuredRows).toBe(false);
+    expect(JSON.stringify(result)).not.toContain("合成候选");
+    expect(storage.writeFile).not.toHaveBeenCalled();
+  });
+
+  it("拒绝跨文件重复银行行，且不写原件或数据库", async () => {
+    const { db } = transactionDb();
+    db.financeImportBatch.findUnique.mockResolvedValue(null);
+    const fixture = makeSyntheticFinanceFixture();
+    const bytes = Buffer.from([
+      "日期,对方户名,贷方发生额,账号,摘要,无关列",
+      `${fixture.bankRow.occurredAt},${fixture.bankRow.counterparty},${fixture.bankRow.amount},6222000000000001,${fixture.bankRow.description},different-copy`
+    ].join("\n"), "utf8");
+    const preview = await previewFinanceImport(formDataFor("duplicate-row.csv"), depsFor(db, storageMock()));
+    db.financeSourceRow.findMany.mockResolvedValue([{ metadata: { rowFingerprint: rowFingerprint(preview.rows[0] as FinanceNormalizedRow) } }]);
+    const storage = storageMock();
+
+    await expect(commitFinanceImport({ fileName: "second-copy.csv", kind: "BANK_STATEMENT", bytes }, depsFor(db, storage)))
+      .rejects.toThrow("包含已导入的重复流水行");
+
+    expect(storage.writeFile).not.toHaveBeenCalled();
+    expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("拒绝同一工资记录重复进入另一来源文件", async () => {
+    vi.stubEnv("STORAGE_ENCRYPTION_KEY", Buffer.alloc(32, 7).toString("base64"));
+    const { db } = transactionDb();
+    db.financeImportBatch.findUnique.mockResolvedValue(null);
+    const bytes = Buffer.from(
+      "月份,姓名,申报工资,实际支付,自担社保\n2026-08,合成人员甲,15000.00,12000.00,800.00",
+      "utf8"
+    );
+    const duplicateDigest = financeTypedRecordFingerprint("PAYROLL", {
+      displayName: "合成人员甲",
+      period: "2026-08",
+      declaredSalary: "15000.00",
+      actualCashPaid: "12000.00",
+      selfCostDue: "800.00"
+    }, Buffer.alloc(32, 7));
+    db.financeImportRecord.findMany.mockResolvedValue([{ normalizedDigest: duplicateDigest }]);
+    const storage = storageMock();
+
+    await expect(commitFinanceImport({ fileName: "same-payroll-different-copy.csv", kind: "PAYROLL", bytes }, depsFor(db, storage)))
+      .rejects.toThrow("包含已导入的重复财务记录");
+
+    expect(storage.writeFile).not.toHaveBeenCalled();
+    expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("相同金额和账期的不同工资人员不会被误判为重复", async () => {
+    vi.stubEnv("STORAGE_ENCRYPTION_KEY", Buffer.alloc(32, 7).toString("base64"));
+    const { db, tx } = transactionDb();
+    db.financeImportBatch.findUnique.mockResolvedValue(null);
+    db.financeImportRecord.findMany.mockResolvedValue([{
+      normalizedDigest: financeTypedRecordFingerprint("PAYROLL", {
+        displayName: "合成人员甲",
+        period: "2026-08",
+        declaredSalary: "15000.00",
+        actualCashPaid: "12000.00",
+        selfCostDue: "800.00"
+      }, Buffer.alloc(32, 7))
+    }]);
+    const bytes = Buffer.from(
+      "月份,姓名,申报工资,实际支付,自担社保\n2026-08,合成人员乙,15000.00,12000.00,800.00",
+      "utf8"
+    );
+
+    await expect(commitFinanceImport({ fileName: "synthetic-payroll-other-person.csv", kind: "PAYROLL", bytes }, depsFor(db, storageMock())))
+      .resolves.toMatchObject({ duplicate: false });
+
+    expect(tx.financeImportRecord.createMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: [expect.objectContaining({ displayName: "合成人员乙" })]
+    }));
+  });
+
+  it("多账期银行流水在写私有原件前被拒绝", async () => {
+    const { db } = transactionDb();
+    db.financeImportBatch.findUnique.mockResolvedValue(null);
+    const bytes = Buffer.from("日期,对方户名,贷方发生额\n2026-07-31,合成甲,100\n2026-08-01,合成乙,200", "utf8");
+    const storage = storageMock();
+
+    await expect(commitFinanceImport({ fileName: "multi-period.csv", kind: "BANK_STATEMENT", bytes }, depsFor(db, storage)))
+      .rejects.toThrow("包含多个账期");
+
+    expect(storage.writeFile).not.toHaveBeenCalled();
+  });
+
+  it("预览应用工作表列索引映射且只返回表头与摘要，不保存原始样例", async () => {
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("账户流水");
+    sheet.addRow(["入账日期", "收付数"]);
+    sheet.addRow(["2026-08-03", "250.00"]);
+    const bytes = Buffer.from(await workbook.xlsx.writeBuffer());
+    const form = new FormData();
+    form.set("kind", "BANK_STATEMENT");
+    form.set("columnMappingsBySheet", JSON.stringify({ "账户流水": { occurredAt: 0, amount: 1 } }));
+    form.set("file", new File([bytes], "synthetic.xlsx"));
+    const { db } = transactionDb();
+    const storage = storageMock();
+
+    const result = await previewFinanceImport(form, depsFor(db, storage));
+
+    expect(result.rows).toMatchObject([{ sourceSheet: "账户流水", sourceRowNumber: 2, occurredAt: "2026-08-03", amount: "250.00" }]);
+    expect(result.sheets).toMatchObject([{ sourceSheet: "账户流水", headerRowNumber: 1, mapping: { occurredAt: 0, amount: 1 } }]);
+    expect(JSON.stringify(result.sheets)).not.toContain("250.00");
+    expect(storage.writeFile).not.toHaveBeenCalled();
+  });
+
+  it("PDF 含未结构化页面时拒绝归档任何结构化行", async () => {
+    const { db } = transactionDb();
+    const storage = storageMock();
+    const document = {
+      version: 1 as const,
+      pages: [{ pageNumber: 1, extraction: "TEXT_CANDIDATE" as const, tables: [], ocrWords: [] }]
+    };
+    const preprocess = vi.fn().mockResolvedValue({ kind: "PDF", document } satisfies FinancePreprocessedUpload);
+
+    await expect(commitFinanceImport({ fileName: "synthetic.pdf", kind: "BANK_STATEMENT", bytes: Buffer.from("pdf") }, { ...depsFor(db, storage), preprocess }))
+      .rejects.toThrow("PDF 页面未能形成稳定表格");
+    expect(storage.writeFile).not.toHaveBeenCalled();
+    expect(db.financeImportBatch.findUnique).not.toHaveBeenCalled();
+  });
+
   it("工资表只归档类型化记录，不制造银行流水或待认领案件", async () => {
+    vi.stubEnv("STORAGE_ENCRYPTION_KEY", Buffer.alloc(32, 7).toString("base64"));
     const { db, tx } = transactionDb();
     db.financeImportBatch.findUnique.mockResolvedValue(null);
     const storage = storageMock();
@@ -145,8 +343,10 @@ describe("内部财务资料导入", () => {
     expect(tx.financeImportRecord.createMany).toHaveBeenCalledWith({
       data: [expect.objectContaining({
         batchId: "batch-new",
+        sourceSheet: "CSV",
         sourceRow: 2,
         kind: "PAYROLL",
+        displayName: "合成人员甲",
         period: "2026-08",
         declaredSalary: "15000.00",
         actualCashPaid: "12000.00",
@@ -154,10 +354,24 @@ describe("内部财务资料导入", () => {
       })]
     });
     const storedRecord = tx.financeImportRecord.createMany.mock.calls[0][0].data[0];
-    expect(storedRecord).not.toHaveProperty("displayName");
+    expect(storedRecord.displayName).toBe("合成人员甲");
     expect(storedRecord).not.toHaveProperty("displayNameDigest");
     expect(tx.financeSourceRow.createMany).not.toHaveBeenCalled();
     expect(tx.financeReconciliationCase.createMany).not.toHaveBeenCalled();
+  });
+
+  it("银行来源行以工作表和行号共同定位，不把不同表的第 2 行冲突", async () => {
+    const { db, tx } = transactionDb();
+    db.financeImportBatch.findUnique.mockResolvedValue(null);
+    const storage = storageMock();
+
+    await commitFinanceImport(
+      { fileName: "synthetic-bank.xlsx", kind: "BANK_STATEMENT", bytes: await twoSheetBankBytes() },
+      depsFor(db, storage)
+    );
+
+    const sourceRows = tx.financeSourceRow.createMany.mock.calls[0][0].data as Array<{ sourceSheet?: string; sourceRow: number }>;
+    expect(sourceRows.map((row) => [row.sourceSheet, row.sourceRow])).toEqual([["银行A", 2], ["银行B", 2]]);
   });
 
   it("没有财务权限的自定义角色不能读取其他人的来源文件", () => {

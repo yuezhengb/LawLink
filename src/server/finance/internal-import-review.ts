@@ -14,10 +14,12 @@ export type FinanceImportReviewRow = {
   id: string;
   batchId: string;
   batchFileName: string;
+  sourceSheet: string;
   sourceRow: number;
   kind: string;
   period: string | null;
   asOfDay: string | null;
+  displayName: string | null;
   roleLabel: string | null;
   statement: string | null;
   item: string | null;
@@ -81,7 +83,7 @@ export async function listFinanceImportReviews(dependencies: FinanceImportReview
       orderBy: [{ batch: { createdAt: "desc" } }, { sourceRow: "asc" }],
       take: 200,
       select: {
-        id: true, batchId: true, sourceRow: true, kind: true, period: true, asOfDay: true, roleLabel: true,
+        id: true, batchId: true, sourceSheet: true, sourceRow: true, kind: true, period: true, asOfDay: true, displayName: true, roleLabel: true,
         statement: true, item: true, amount: true, declaredSalary: true, actualCashPaid: true, selfCostDue: true,
         resolvedUserId: true, reviewStatus: true,
         batch: { select: { fileName: true } },
@@ -97,10 +99,12 @@ export async function listFinanceImportReviews(dependencies: FinanceImportReview
       id: row.id,
       batchId: row.batchId,
       batchFileName: row.batch.fileName,
+      sourceSheet: row.sourceSheet,
       sourceRow: row.sourceRow,
       kind: String(row.kind),
       period: row.period,
       asOfDay: row.asOfDay?.toISOString().slice(0, 10) ?? null,
+      displayName: row.displayName,
       roleLabel: row.roleLabel,
       statement: row.statement ? String(row.statement) : null,
       item: row.item,

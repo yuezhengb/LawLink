@@ -9,27 +9,48 @@
  * 本测试扫描全仓 action/targetType 字面量做元断言，防止同类回归。
  */
 import { describe, expect, it } from "vitest";
-import { execSync } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { auditActionLabel, auditTargetLabel } from "@/lib/audit-labels";
 
-function scan(pattern: string): string[] {
-  const out = execSync(`grep -rhoE '${pattern}' src/server src/app src/lib || true`, {
-    encoding: "utf-8",
-    cwd: process.cwd()
+function sourceFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) return sourceFiles(path);
+    return /\.[cm]?[jt]sx?$/.test(entry.name) ? [path] : [];
   });
-  return [...new Set([...out.matchAll(/"([A-Za-z_]+)"/g)].map((m) => m[1]))].sort();
+}
+
+function extractValues(source: string, property: "action" | "targetType"): string[] {
+  const valuePattern = property === "action" ? "[A-Z_]+" : "[A-Za-z]+";
+  const pattern = new RegExp(`\\b${property}\\s*:\\s*"(${valuePattern})"`, "g");
+  return [...source.matchAll(pattern)].map((match) => match[1]);
+}
+
+function scan(property: "action" | "targetType"): string[] {
+  const values = ["src/server", "src/app", "src/lib"].flatMap((directory) =>
+    sourceFiles(join(process.cwd(), directory)).flatMap((file) =>
+      extractValues(readFileSync(file, "utf8"), property)
+    )
+  );
+  return [...new Set(values)].sort();
 }
 
 describe("审计动作标签", () => {
+  it("只识别 action 字段，不把 extraction 的值误当成审计动作", () => {
+    expect(extractValues('extraction: "TEXT_CANDIDATE", action: "FINANCE_IMPORT"', "action"))
+      .toEqual(["FINANCE_IMPORT"]);
+  });
+
   it("全仓每个 action 都能拼出中文，不落到「其他操作」", () => {
-    const actions = scan('action: ?"[A-Z_]+"');
+    const actions = scan("action");
     expect(actions.length).toBeGreaterThan(150); // 扫描确实生效
     const degraded = actions.filter((a) => auditActionLabel(a) === "其他操作（详见技术详情）");
     expect(degraded, `以下动作缺词条，请补 src/lib/audit-labels.ts 的 words：\n${degraded.join("\n")}`).toEqual([]);
   });
 
   it("全仓每个 targetType 都有中文标签，不落到「其他对象」", () => {
-    const types = scan('targetType: ?"[A-Za-z]+"');
+    const types = scan("targetType");
     expect(types.length).toBeGreaterThan(40);
     const degraded = types.filter((t) => auditTargetLabel(t) === "其他对象");
     expect(degraded, `以下对象缺标签，请补 src/lib/audit-labels.ts 的 targetLabels：\n${degraded.join("\n")}`).toEqual([]);

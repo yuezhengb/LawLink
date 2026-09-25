@@ -8,6 +8,7 @@ function reviewFixture(kind: "PAYROLL" | "ROSTER" | "EXTERNAL_THREE_STATEMENTS" 
   let record: Record<string, unknown> = {
     id: "synthetic-import-record",
     batchId: "synthetic-import-batch",
+    sourceSheet: "律师工资",
     sourceRow: 2,
     kind,
     period: "2026-08",
@@ -110,11 +111,11 @@ describe("律所类型化财务资料人工复核", () => {
     expect(restricted.db.$transaction).not.toHaveBeenCalled();
   });
 
-  it("复核列表不返回或生成姓名摘要，只返回行号、业务值和已关联人员", async () => {
+  it("复核列表在财务读取范围返回来源姓名，不生成姓名摘要", async () => {
     const db = {
       financeImportRecord: { findMany: vi.fn().mockResolvedValue([{
-        id: "synthetic-import-record", batchId: "synthetic-import-batch", sourceRow: 2, kind: "PAYROLL",
-        period: "2026-08", asOfDay: null, roleLabel: null, statement: null, item: null, amount: null,
+        id: "synthetic-import-record", batchId: "synthetic-import-batch", sourceSheet: "工资明细", sourceRow: 2, kind: "PAYROLL",
+        period: "2026-08", asOfDay: null, roleLabel: null, statement: null, item: null, amount: null, displayName: "合成人员甲",
         declaredSalary: new Prisma.Decimal("15000.00"), actualCashPaid: new Prisma.Decimal("12000.00"),
         selfCostDue: new Prisma.Decimal("800.00"), resolvedUserId: "synthetic-lawyer", reviewStatus: "RESOLVED",
         batch: { fileName: "synthetic-payroll.csv" }, resolvedUser: { name: "合成人员" }
@@ -124,8 +125,7 @@ describe("律所类型化财务资料人工复核", () => {
 
     const result = await listFinanceImportReviews({ db: db as never, actor });
 
-    expect(result.records[0]).toMatchObject({ sourceRow: 2, declaredSalary: "15000.00", resolvedUserName: "合成人员" });
-    expect(result.records[0]).not.toHaveProperty("displayName");
+    expect(result.records[0]).toMatchObject({ sourceSheet: "工资明细", sourceRow: 2, displayName: "合成人员甲", declaredSalary: "15000.00", resolvedUserName: "合成人员" });
     expect(result.records[0]).not.toHaveProperty("displayNameDigest");
   });
 

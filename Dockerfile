@@ -34,6 +34,8 @@ COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=nextjs:nodejs /app/package.json ./package.json
 COPY --from=builder --chown=nextjs:nodejs /app/prisma ./prisma
 COPY --from=builder --chown=nextjs:nodejs /app/src/lib ./src/lib
+COPY --from=builder --chown=nextjs:nodejs /app/src/server/finance ./src/server/finance
+COPY --from=builder --chown=nextjs:nodejs /app/src/server/audit.ts ./src/server/audit.ts
 COPY --from=builder --chown=nextjs:nodejs /app/tsconfig.json ./tsconfig.json
 COPY --from=builder --chown=nextjs:nodejs /app/next.config.mjs ./next.config.mjs
 # 备份脚本必须进镜像：cron job 通过 process.cwd()/scripts/backup.sh 调用
@@ -43,6 +45,8 @@ COPY --from=builder --chown=nextjs:nodejs /app/scripts ./scripts
 RUN test -f .next-build/BUILD_ID \
     && test -f next.config.mjs \
     && test -f src/lib/template-builder.ts \
+    && test -f src/server/finance/private-finance-import-actor.ts \
+    && test -f scripts/finance-import-private-commit.ts \
     && test -f tsconfig.json
 
 # backups 目录预先建好并授权：命名卷首次挂载会继承镜像内目录属主，
