@@ -56,3 +56,7 @@ outputs/
 # Local test and browser artifacts are not release content
 output/
 /.worktrees/
+
+# Python test caches
+__pycache__/
+*.py[cod]

@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ImportWorkspace } from "@/app/(app)/finance/internal/_components/import-workspace";
 import { LedgerWorkspace } from "@/app/(app)/finance/internal/_components/ledger-workspace";
@@ -7,7 +7,7 @@ import { ReconciliationWorkspace } from "@/app/(app)/finance/internal/_component
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
 
-afterEach(() => cleanup());
+afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 describe("内部财务工作区", () => {
   it("没有导入权限时不渲染上传按钮", () => {
@@ -15,12 +15,67 @@ describe("内部财务工作区", () => {
     expect(screen.queryByRole("button", { name: "上传并预览" })).not.toBeInTheDocument();
   });
 
-  it("类型化财务资料按原文件行号人工关联，不显示姓名字段", () => {
+  it("导入区支持 PDF，允许修正字段映射，并要求映射变更后重新预览", async () => {
+    const preview = (mapping: Record<string, number>, missingFields: string[]) => ({
+      fileName: "synthetic.pdf",
+      kind: "BANK_STATEMENT",
+      headers: ["交易日", "入账数"],
+      rows: [{ sourceSheet: "PDF第1页-表1", sourceRowNumber: 2, occurredAt: "2026-08-01", amount: "100.00", direction: "CREDIT", counterparty: "合成***", description: null }],
+      errors: [],
+      validCount: 1,
+      totalRows: 1,
+      sheets: [{ sourceSheet: "PDF第1页-表1", headers: ["交易日", "入账数"], headerRowNumber: 1, headersDigest: "a".repeat(64), mapping, missingFields }],
+      pdfCandidates: [],
+      canCommitStructuredRows: true
+    });
+    const fetch = vi.spyOn(global, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] })))
+      .mockResolvedValueOnce(new Response(JSON.stringify(preview({ occurredAt: 0 }, ["amount"]))))
+      .mockResolvedValueOnce(new Response(JSON.stringify(preview({ occurredAt: 0, amount: 1 }, []))));
+    render(<ImportWorkspace batches={[]} reviewRecords={[]} reviewUsers={[]} canImport canReview={false} />);
+
+    const fileInput = screen.getByLabelText("来源文件") as HTMLInputElement;
+    expect(fileInput.accept).toContain(".pdf");
+    fireEvent.change(fileInput, { target: { files: [new File(["synthetic"], "synthetic.pdf", { type: "application/pdf" })] } });
+    fireEvent.click(screen.getByRole("button", { name: "上传并预览" }));
+    await screen.findByRole("combobox", { name: "PDF第1页-表1 交易金额列" });
+
+    fireEvent.change(screen.getByRole("combobox", { name: "PDF第1页-表1 交易金额列" }), { target: { value: "1" } });
+    expect(screen.getByRole("button", { name: "提交到归档" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "重新预览" }));
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getByRole("button", { name: "提交到归档" })).toBeEnabled());
+  });
+
+  it("案件登记清单只读比对展示案号差异，不启动导入/提交", async () => {
+    const fetch = vi.spyOn(global, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        counts: { totalRows: 2, comparableRows: 2, matched: 1, registerOnly: 1, systemOnly: 0, duplicateRegister: 0, contractNumbersUncompared: 2 },
+        differences: [{ status: "REGISTER_ONLY", caseNumber: "SYN-CASE-ONLY", contractNumber: "SYN-CONTRACT-ONLY" }],
+        warnings: ["系统没有独立合同编号字段；合同编号仅作清单参考，未与案号匹配。"], sheetsReviewed: 1, sheetsSkipped: 0
+      })));
+    render(<ImportWorkspace batches={[]} reviewRecords={[]} reviewUsers={[]} canImport canReview={false} />);
+
+    const fileInput = screen.getByLabelText("案件登记清单") as HTMLInputElement;
+    expect(fileInput.accept).toContain(".xlsx");
+    fireEvent.change(fileInput, { target: { files: [new File(["synthetic"], "synthetic.xlsx", { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" })] } });
+    fireEvent.click(screen.getByRole("button", { name: "只读比对" }));
+
+    expect(await screen.findByText("SYN-CASE-ONLY")).toBeInTheDocument();
+    expect(screen.getByText("SYN-CONTRACT-ONLY")).toBeInTheDocument();
+    expect(screen.getByText(/不创建、修改案件、合同或收付款/)).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch.mock.calls[1][0]).toBe("/api/finance/internal/imports/case-register-preview");
+  });
+
+  it("类型化财务资料在内部财务复核页显示来源姓名并由人工关联", () => {
     render(<ImportWorkspace
       batches={[]}
       reviewRecords={[{
-        id: "synthetic-record", batchId: "synthetic-batch", batchFileName: "synthetic-payroll.csv", sourceRow: 2,
-        kind: "PAYROLL", period: "2026-08", asOfDay: null, roleLabel: null, statement: null, item: null,
+        id: "synthetic-record", batchId: "synthetic-batch", batchFileName: "synthetic-payroll.csv", sourceSheet: "工资明细", sourceRow: 2,
+        kind: "PAYROLL", period: "2026-08", asOfDay: null, roleLabel: null, statement: null, item: null, displayName: "合成人员甲",
         amount: null, declaredSalary: "15000.00", actualCashPaid: "12000.00", selfCostDue: "800.00",
         resolvedUserId: null, resolvedUserName: null, reviewStatus: "NEEDS_REVIEW"
       }]}
@@ -29,9 +84,9 @@ describe("内部财务工作区", () => {
       canReview
     />);
 
-    expect(screen.getByText("工资表 · 第 2 行 · 2026-08")).toBeInTheDocument();
+    expect(screen.getByText("工资表 · 工资明细 · 第 2 行 · 2026-08")).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "第 2 行关联人员" })).toHaveTextContent("合成人员");
-    expect(screen.queryByRole("columnheader", { name: /姓名/ })).not.toBeInTheDocument();
+    expect(screen.getByText("来源姓名 合成人员甲")).toBeInTheDocument();
   });
 
   it("没有正式批次时不展示假金额", () => {

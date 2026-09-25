@@ -15,6 +15,7 @@ jobs:
       packages: write
     env:
       IMAGE: ghcr.io/yuezhengb/lawlink-finance
+      PREPROCESSOR_IMAGE: ghcr.io/yuezhengb/lawlink-finance-preprocessor
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -24,6 +25,33 @@ jobs:
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USERNAME" --password-stdin
+
+      - name: Build isolated finance preprocessor image
+        run: |
+          docker build \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$PREPROCESSOR_IMAGE:$GITHUB_SHA" \
+            services/finance-preprocessor
+
+      - name: Smoke-test private finance preprocessor
+        run: |
+          set -euo pipefail
+          CONTAINER=lawlink-finance-preprocessor-smoke
+          cleanup() { docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run -d --network none --name "$CONTAINER" \
+            -e FINANCE_PREPROCESSOR_TOKEN=ci-only-preprocessor-token \
+            "$PREPROCESSOR_IMAGE:$GITHUB_SHA" >/dev/null
+          for attempt in $(seq 1 30); do
+            if docker exec "$CONTAINER" python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8080/healthz", timeout=2).read()' >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Finance preprocessor health check failed"
+          docker logs "$CONTAINER" 2>/dev/null | tail -n 20
+          exit 1
 
       - name: Build image
         run: |
@@ -75,4 +103,5 @@ jobs:
       - name: Publish image
         run: |
           docker push "$IMAGE:$GITHUB_SHA"
-          printf 'Published image: `%s:%s`\n' "$IMAGE" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          docker push "$PREPROCESSOR_IMAGE:$GITHUB_SHA"
+          printf 'Published private finance images for commit `%s`.\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"

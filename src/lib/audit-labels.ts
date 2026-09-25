@@ -37,7 +37,10 @@ const targetLabels: Record<string, string> = {
   FinanceOperatingCost: "律所经营成本",
   FinanceImportRecord: "财务资料记录",
   FinancePeriodCoverage: "财务来源覆盖确认",
-  FinancePersonLedgerEntry: "个人财务台账"
+  FinancePersonLedgerEntry: "个人财务台账",
+  CaseRegisterPreview: "案件登记清单预览",
+  FinanceImportMappingTemplate: "财务字段映射模板",
+  FinanceWecomNotification: "财务企微通知"
 };
 const words: Record<string, string> = {
   BUILTIN: "内置", ROLE: "角色", PRESENTATION: "显示资料", DEFINITION: "定义",
@@ -88,7 +91,9 @@ const words: Record<string, string> = {
   MONTHLY: "月度", PARTNER: "合伙人", TAX: "税款", PAYROLL: "工资", UPSERT: "保存",
   RECONCILIATION: "流水核对", DECISION: "裁定", REFUND: "退款", PUBLISH: "发布",
   OPENING: "期初余额", OPERATING: "经营", PERSON: "人员", BALANCE: "余额",
-  COST: "成本", COVERAGE: "覆盖", RECORD: "记录", RESOLVE: "复核"
+  COST: "成本", COVERAGE: "覆盖", RECORD: "记录", RESOLVE: "复核",
+  REGISTER: "登记", MAPPING: "映射", PERSONAL: "个人", SETTLEMENT: "结算",
+  WECOM: "企微", SEND: "发送", ATTEMPT: "尝试", RESULT: "结果"
 };
 export function auditActionLabel(code: string): string {
   const parts = code.split("_");

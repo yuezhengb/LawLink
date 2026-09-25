@@ -19,10 +19,10 @@ export async function parseFinanceSource(
   kind: FinanceSourceKind,
   options: FinanceSourceParseOptions = {}
 ): Promise<FinanceSourceParseResult> {
-  if (kind === "BANK_STATEMENT") return parseFinanceWorkbook(bytes, fileName, kind);
-  if (kind === "PAYROLL") return parsePayrollWorkbook(bytes, fileName, options.period);
-  if (kind === "ROSTER") return parseRosterWorkbook(bytes, fileName, options.asOfDay);
-  if (kind === "EXTERNAL_THREE_STATEMENTS") return parseExternalStatementsWorkbook(bytes, fileName, options.period);
+  if (kind === "BANK_STATEMENT") return parseFinanceWorkbook(bytes, fileName, kind, options.mapping, options.columnMappingsBySheet);
+  if (kind === "PAYROLL") return parsePayrollWorkbook(bytes, fileName, options.period, options.columnMappingsBySheet);
+  if (kind === "ROSTER") return parseRosterWorkbook(bytes, fileName, options.asOfDay, options.columnMappingsBySheet);
+  if (kind === "EXTERNAL_THREE_STATEMENTS") return parseExternalStatementsWorkbook(bytes, fileName, options.period, options.columnMappingsBySheet);
   const table = await readFinanceMatrix(bytes, fileName);
   const nonEmptyRows = table.matrix.filter((row) => row.some((cell) => cell.trim().length > 0));
   const errors = [...table.errors];

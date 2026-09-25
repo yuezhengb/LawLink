@@ -13,6 +13,7 @@ export type FinanceNormalizedRow = {
   sourceKind: FinanceSourceKind;
   sourceBatchId?: string;
   sourceFileId?: string;
+  sourceSheet?: string;
   sourceRowNumber: number;
   occurredAt: string;
   amount: FinanceDecimal;
@@ -29,6 +30,7 @@ export type FinanceNormalizedRow = {
 
 export type FinanceRowError = {
   rowNumber: number;
+  sourceSheet?: string;
   code:
     | "MISSING_OCCURRED_AT"
     | "INVALID_OCCURRED_AT"
@@ -60,6 +62,27 @@ export type FinanceColumnMapping = Partial<Record<
   | "description"
   | "externalReference"
   | "invoiceReference", string>>;
+
+export type FinanceTypedImportField = "period" | "name" | "salary" | "actual" | "selfCost" | "role" | "statement" | "item" | "amount";
+export type FinanceImportField = keyof FinanceColumnMapping | FinanceTypedImportField;
+export type FinanceImportIndexMapping = Partial<Record<FinanceImportField, number>>;
+export type FinanceColumnMappingsBySheet = Record<string, FinanceImportIndexMapping>;
+
+export type FinanceImportSheetPreview = {
+  sourceSheet: string;
+  headers: string[];
+  headerRowNumber: number;
+  headersDigest: string;
+  mapping: FinanceImportIndexMapping;
+  missingFields: FinanceImportField[];
+  templateId?: string;
+};
+
+export type FinancePdfImportCandidate = {
+  pageNumber: number;
+  extraction: "TEXT_CANDIDATE" | "OCR_CANDIDATE";
+  wordCount: number;
+};
 
 export type FinanceParseResult = {
   fileName: string;
@@ -174,6 +197,9 @@ export type FinanceImportPreview = {
   reviewWarnings?: string[];
   period?: string;
   asOfDay?: string;
+  sheets?: FinanceImportSheetPreview[];
+  pdfCandidates?: FinancePdfImportCandidate[];
+  canCommitStructuredRows?: boolean;
 };
 
 export type CommitFinanceImportInput = {
@@ -181,6 +207,7 @@ export type CommitFinanceImportInput = {
   kind: FinanceSourceKind;
   bytes: Buffer;
   mapping?: FinanceColumnMapping;
+  columnMappingsBySheet?: FinanceColumnMappingsBySheet;
   period?: string;
   asOfDay?: string;
 };
@@ -252,6 +279,7 @@ export type FirmOperatingResultInput = {
 };
 
 export type FinancePayrollImportRow = {
+  sourceSheet?: string;
   sourceRowNumber: number;
   period: string;
   displayName: string;
@@ -261,6 +289,7 @@ export type FinancePayrollImportRow = {
 };
 
 export type FinanceRosterImportRow = {
+  sourceSheet?: string;
   sourceRowNumber: number;
   asOfDay: string;
   displayName: string;
@@ -268,6 +297,7 @@ export type FinanceRosterImportRow = {
 };
 
 export type FinanceExternalStatementImportRow = {
+  sourceSheet?: string;
   sourceRowNumber: number;
   period: string;
   statement: "BALANCE_SHEET" | "INCOME" | "CASH_FLOW";
@@ -294,7 +324,12 @@ export type FinanceSourceParseResult =
   | FinanceTypedParseResult<FinanceExternalStatementImportRow, "EXTERNAL_THREE_STATEMENTS">
   | FinanceTypedParseResult<never, "OTHER">;
 
-export type FinanceSourceParseOptions = { period?: string; asOfDay?: string };
+export type FinanceSourceParseOptions = {
+  period?: string;
+  asOfDay?: string;
+  mapping?: FinanceColumnMapping;
+  columnMappingsBySheet?: FinanceColumnMappingsBySheet;
+};
 
 export type FinancePeriodCoverageInput = {
   bankAccounts: Array<{ alias: string; batchIds: string[]; noTransactionsReason?: string }>;

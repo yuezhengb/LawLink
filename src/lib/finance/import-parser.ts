@@ -7,15 +7,19 @@ import type {
   FinanceNormalizedRow,
   FinanceParseResult,
   FinanceRowError,
-  FinanceSourceKind
+  FinanceSourceKind,
+  FinanceImportIndexMapping,
+  FinanceColumnMappingsBySheet
 } from "@/lib/finance/internal-types";
 
 type FinanceField = keyof FinanceColumnMapping;
 type RawRecord = Record<string, unknown>;
 type Matrix = string[][];
+export type FinanceMatrixSheet = { name: string; matrix: Matrix };
 
 type NormalizationOptions = {
   sourceKind: FinanceSourceKind;
+  sourceSheet?: string;
   sourceRowNumber: number;
   sourceBatchId?: string;
   sourceFileId?: string;
@@ -225,13 +229,13 @@ export function normalizeFinanceRow(
   const debit = parseMoney(mappedValue(record, mapping, "debit"));
   const credit = parseMoney(mappedValue(record, mapping, "credit"));
   const generic = parseMoney(mappedValue(record, mapping, "amount"));
+  const hasDebitCredit = debit !== "EMPTY" || credit !== "EMPTY";
   if (debit === "INVALID") return invalidAmountError(options.sourceRowNumber, "借方金额");
   if (credit === "INVALID") return invalidAmountError(options.sourceRowNumber, "贷方金额");
-  if (generic === "INVALID") return invalidAmountError(options.sourceRowNumber, "金额");
+  if (generic === "INVALID" && !hasDebitCredit) return invalidAmountError(options.sourceRowNumber, "金额");
 
   let amount: string;
   let direction: FinanceDirection;
-  const hasDebitCredit = debit !== "EMPTY" || credit !== "EMPTY";
   if (hasDebitCredit) {
     if (debit !== "EMPTY" && credit !== "EMPTY" && !debit.zero && !credit.zero) {
       return error(options.sourceRowNumber, "INVALID_DIRECTION", `第 ${options.sourceRowNumber} 行同时存在借方和贷方金额`, "direction");
@@ -250,6 +254,7 @@ export function normalizeFinanceRow(
     if (generic === "EMPTY") {
       return error(options.sourceRowNumber, "MISSING_AMOUNT", `第 ${options.sourceRowNumber} 行缺少金额`, "amount");
     }
+    if (generic === "INVALID") return invalidAmountError(options.sourceRowNumber, "金额");
     amount = generic.signed;
     direction = generic.zero ? "UNKNOWN" : generic.negative ? "DEBIT" : "CREDIT";
   }
@@ -265,6 +270,7 @@ export function normalizeFinanceRow(
     sourceKind: options.sourceKind,
     sourceBatchId: options.sourceBatchId,
     sourceFileId: options.sourceFileId,
+    sourceSheet: options.sourceSheet,
     sourceRowNumber: options.sourceRowNumber,
     occurredAt: occurredAt.value!,
     amount,
@@ -297,7 +303,9 @@ function mapMatrix(
   matrix: Matrix,
   fileName: string,
   kind: "BANK_STATEMENT",
-  suppliedMapping?: FinanceColumnMapping
+  suppliedMapping?: FinanceColumnMapping,
+  sourceSheet = "CSV",
+  indexMapping?: FinanceImportIndexMapping
 ): FinanceParseResult {
   const firstDataRow = matrix.findIndex(nonEmptyRow);
   if (firstDataRow < 0) {
@@ -315,14 +323,23 @@ function mapMatrix(
   let detected = detectFinanceColumnMapping(matrix[headerIndex]);
   for (let index = firstDataRow; index < Math.min(matrix.length, firstDataRow + 20); index += 1) {
     const candidate = detectFinanceColumnMapping(matrix[index]);
-    if (Object.keys(candidate).length > Object.keys(detected).length) {
+    const candidateDensity = matrix[index].filter((cell) => normalizeWhitespace(cell).length > 0).length;
+    const detectedDensity = matrix[headerIndex].filter((cell) => normalizeWhitespace(cell).length > 0).length;
+    if (Object.keys(candidate).length > Object.keys(detected).length || (Object.keys(candidate).length === Object.keys(detected).length && candidateDensity > detectedDensity)) {
       headerIndex = index;
       detected = candidate;
     }
   }
 
   const headers = matrix[headerIndex].map((header) => normalizeWhitespace(header));
-  const mapping = { ...detected, ...(suppliedMapping ?? {}) };
+  const mapping: FinanceColumnMapping = { ...detected };
+  const bankFields = new Set<FinanceField>(FIELDS);
+  for (const [field, index] of Object.entries(indexMapping ?? {}) as Array<[keyof FinanceColumnMapping, number]>) {
+    if (bankFields.has(field) && Number.isInteger(index) && index >= 0 && index < headers.length) {
+      mapping[field] = `__finance_import_column_${index}`;
+    }
+  }
+  Object.assign(mapping, suppliedMapping ?? {});
   if (Object.keys(mapping).length === 0) {
     return {
       fileName,
@@ -345,9 +362,10 @@ function mapMatrix(
     const raw: RawRecord = {};
     headers.forEach((header, columnIndex) => {
       if (header) raw[header] = values[columnIndex] ?? "";
+      raw[`__finance_import_column_${columnIndex}`] = values[columnIndex] ?? "";
     });
-    const normalized = normalizeFinanceRow(raw, mapping, { sourceKind: kind, sourceRowNumber });
-    if ("code" in normalized) errors.push(normalized);
+    const normalized = normalizeFinanceRow(raw, mapping, { sourceKind: kind, sourceSheet, sourceRowNumber });
+    if ("code" in normalized) errors.push({ ...normalized, sourceSheet });
     else rows.push(normalized);
   }
 
@@ -391,11 +409,10 @@ function parseCsv(text: string): Matrix {
   return rows;
 }
 
-async function readXlsx(bytes: Buffer): Promise<Matrix> {
+async function readXlsxSheets(bytes: Buffer): Promise<FinanceMatrixSheet[]> {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(bytes as unknown as ArrayBuffer);
-  const sheet = workbook.worksheets[0];
-  if (!sheet) return [];
+  return workbook.worksheets.map((sheet) => {
   const rows = new Map<number, Map<number, string>>();
   let maxRowNumber = 0;
   let maxColumnNumber = 0;
@@ -415,45 +432,63 @@ async function readXlsx(bytes: Buffer): Promise<Matrix> {
     maxRowNumber = Math.max(maxRowNumber, row.number);
   });
 
-  if (maxRowNumber === 0 || maxColumnNumber === 0) return [];
+  if (maxRowNumber === 0 || maxColumnNumber === 0) return { name: sheet.name, matrix: [] };
   const matrix: Matrix = Array.from({ length: maxRowNumber }, () => Array(maxColumnNumber).fill(""));
   for (const [rowNumber, values] of rows) {
     for (const [columnNumber, value] of values) matrix[rowNumber - 1][columnNumber - 1] = value;
   }
-  return matrix;
+  return { name: sheet.name, matrix };
+  });
+}
+
+export async function readFinanceWorkbookSheets(bytes: Buffer, fileName: string): Promise<{ sheets: FinanceMatrixSheet[]; errors: FinanceRowError[] }> {
+  const extension = fileName.toLowerCase().split(".").pop() ?? "";
+  if (extension === "xls") {
+    return {
+      sheets: [],
+      errors: [error(0, "UNSUPPORTED_LEGACY_XLS", "传统 XLS 格式需要先通过隔离预处理服务转换为 XLSX。")]
+    };
+  }
+  if (extension !== "csv" && extension !== "xlsx") {
+    return { sheets: [], errors: [error(0, "UNSUPPORTED_FILE_FORMAT", "仅支持 CSV 或 XLSX 文件")] };
+  }
+  try {
+    const sheets = extension === "csv"
+      ? [{ name: "CSV", matrix: parseCsv(bytes.toString("utf8")) }]
+      : await readXlsxSheets(bytes);
+    if (!sheets.some((sheet) => sheet.matrix.some(nonEmptyRow))) {
+      return { sheets: [], errors: [error(0, "EMPTY_WORKBOOK", "文件中没有可读取的数据")] };
+    }
+    return { sheets, errors: [] };
+  } catch (caught) {
+    const detail = caught instanceof Error ? caught.message : "未知解析错误";
+    return { sheets: [], errors: [error(0, "PARSE_FAILURE", `文件解析失败：${detail}`)] };
+  }
 }
 
 export async function readFinanceMatrix(
   bytes: Buffer,
   fileName: string
 ): Promise<{ matrix: Matrix; errors: FinanceRowError[] }> {
-  const extension = fileName.toLowerCase().split(".").pop() ?? "";
-  if (extension === "xls") {
-    return {
-      matrix: [],
-      errors: [error(0, "UNSUPPORTED_LEGACY_XLS", "传统 XLS 格式暂不支持，请先在本地转换为 XLSX 后重新上传；服务器不会执行外部转换器。")]
-    };
-  }
-  if (extension !== "csv" && extension !== "xlsx") {
-    return { matrix: [], errors: [error(0, "UNSUPPORTED_FILE_FORMAT", "仅支持 CSV 或 XLSX 文件")] };
-  }
-  try {
-    const matrix = extension === "csv" ? parseCsv(bytes.toString("utf8")) : await readXlsx(bytes);
-    if (!matrix.some(nonEmptyRow)) return { matrix, errors: [error(0, "EMPTY_WORKBOOK", "文件中没有可读取的数据")] };
-    return { matrix, errors: [] };
-  } catch (caught) {
-    const detail = caught instanceof Error ? caught.message : "未知解析错误";
-    return { matrix: [], errors: [error(0, "PARSE_FAILURE", `文件解析失败：${detail}`)] };
-  }
+  const result = await readFinanceWorkbookSheets(bytes, fileName);
+  return { matrix: result.sheets[0]?.matrix ?? [], errors: result.errors };
 }
 
 export async function parseFinanceWorkbook(
   bytes: Buffer,
   fileName: string,
   kind: "BANK_STATEMENT",
-  suppliedMapping?: FinanceColumnMapping
+  suppliedMapping?: FinanceColumnMapping,
+  indexMappingsBySheet: FinanceColumnMappingsBySheet = {}
 ): Promise<FinanceParseResult> {
-  const result = await readFinanceMatrix(bytes, fileName);
+  const result = await readFinanceWorkbookSheets(bytes, fileName);
   if (result.errors.length > 0) return { fileName, kind, headers: [], rows: [], errors: result.errors, totalRows: 0 };
-  return mapMatrix(result.matrix, fileName, kind, suppliedMapping);
+  const parsed = result.sheets.map((sheet) => mapMatrix(sheet.matrix, fileName, kind, suppliedMapping, sheet.name, indexMappingsBySheet[sheet.name]));
+  const primary = parsed[0];
+  return {
+    ...primary,
+    rows: parsed.flatMap((part) => part.rows),
+    errors: parsed.flatMap((part) => part.errors),
+    totalRows: parsed.reduce((sum, part) => sum + part.totalRows, 0)
+  };
 }

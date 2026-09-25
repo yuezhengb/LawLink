@@ -1,15 +1,16 @@
 import Link from "next/link";
-import { ArrowRight, ClipboardCheck, FileArchive, Landmark, LockKeyhole, UploadCloud } from "lucide-react";
+import { ArrowRight, ClipboardCheck, FileArchive, Landmark, LockKeyhole, UploadCloud, Wallet } from "lucide-react";
 import { PageHeader, Panel, ProcedureChain, Tag } from "@/components/patterns/moan";
 import { hasCustomPermission } from "@/lib/roles/catalog";
-import { getMonthlyCloseStatus } from "@/server/finance/monthly-close";
 import { currentFinancePeriod, requireInternalFinanceSession } from "@/server/finance/internal-workspaces";
+import { getInternalFinanceOverview } from "@/server/finance/internal-finance-workspaces";
 import { InternalFinanceNav } from "./_components/internal-finance-nav";
 
 export default async function InternalFinanceOverviewPage() {
   const session = await requireInternalFinanceSession();
   const period = currentFinancePeriod();
-  const status = await getMonthlyCloseStatus(period, { actor: session.user });
+  const overview = await getInternalFinanceOverview(period, session.user);
+  const status = overview.closeStatus;
   const canImport = session.user.role === "FINANCE" || hasCustomPermission(session.user, "finance.import");
   const canReconcile = hasCustomPermission(session.user, "finance.reconcile");
   const canRules = hasCustomPermission(session.user, "finance.rules");
@@ -25,6 +26,15 @@ export default async function InternalFinanceOverviewPage() {
         <OverviewMetric icon={Landmark} label="正式计算" value={status.runId ? "已提交" : "未生成"} hint={status.runId ? "结果来自固定来源指纹" : "完成分配后生成"} tone={status.runId ? "green" : "amber"} />
         <OverviewMetric icon={FileArchive} label="月结状态" value={status.ready ? "可交付" : "有阻断项"} hint={status.ready ? "可以生成交付包" : status.blockingWarnings[0] ?? "需要继续核对"} tone={status.ready ? "green" : "amber"} />
       </div>
+
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+        <OverviewMetric icon={Wallet} label="正式律师费收入" value={overview.officialSnapshot ? `¥${overview.officialSnapshot.feeRevenue}` : "未生成"} hint={overview.officialSnapshot ? "来自已提交分配快照" : "暂无正式计算快照"} tone={overview.officialSnapshot ? "teal" : "slate"} />
+        <OverviewMetric icon={Landmark} label="律所留存" value={overview.officialSnapshot ? `¥${overview.officialSnapshot.firmRetained}` : "未生成"} hint="正式快照口径" tone={overview.officialSnapshot ? "teal" : "slate"} />
+        <OverviewMetric icon={Wallet} label="律师分配" value={overview.officialSnapshot ? `¥${overview.officialSnapshot.lawyerAllocation}` : "未生成"} hint="正式快照口径" tone={overview.officialSnapshot ? "teal" : "slate"} />
+        <OverviewMetric icon={Landmark} label="银行来源入账" value={overview.bank.creditAmount === null ? "未归档" : `¥${overview.bank.creditAmount}`} hint={`${overview.bank.creditRows} 条来源流水；不等同确认收款`} tone={overview.bank.creditAmount === null ? "slate" : "teal"} />
+        <OverviewMetric icon={ClipboardCheck} label="已确认关联流水" value={overview.bank.confirmedCreditAmount === null ? "待核对" : `¥${overview.bank.confirmedCreditAmount}`} hint="仅统计已明确关联案件收款的来源流水" tone={overview.bank.confirmedCreditAmount === null ? "slate" : "green"} />
+      </div>
+      <div className="mo-note"><Landmark className="mt-0.5 h-4 w-4 shrink-0 text-[var(--teal)]" aria-hidden="true" /><span>银行入账金额是原始流水口径；已确认关联额单独统计。无正式快照或未归档来源时显示“未生成/未归档”，不会用 0 代替未知。</span></div>
 
       <Panel title="本期工作链" icon={Landmark} extra={<Tag tone="slate">不替代法定财务报表</Tag>}>
         <ProcedureChain nodes={[

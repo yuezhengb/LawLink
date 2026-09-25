@@ -14,6 +14,17 @@ async function xlsxBuffer(rows: unknown[][]): Promise<Buffer> {
   return Buffer.from(await workbook.xlsx.writeBuffer());
 }
 
+async function multiSheetXlsxBuffer(): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook();
+  const first = workbook.addWorksheet("银行A");
+  first.addRow(["日期", "对方户名", "贷方发生额"]);
+  first.addRow(["2026-08-01", "合成客户甲", "100.00"]);
+  const second = workbook.addWorksheet("银行B");
+  second.addRow(["日期", "对方户名", "贷方发生额"]);
+  second.addRow(["2026-08-02", "合成客户乙", "200.00"]);
+  return Buffer.from(await workbook.xlsx.writeBuffer());
+}
+
 async function wideFormattedXlsxBuffer(): Promise<Buffer> {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet("Sheet1");
@@ -106,6 +117,49 @@ describe("财务来源文件解析", () => {
     expect(result.totalRows).toBe(1);
   });
 
+  it("解析所有银行工作表并保留各表内真实行号", async () => {
+    const result = await parseFinanceWorkbook(await multiSheetXlsxBuffer(), "synthetic-bank.xlsx", "BANK_STATEMENT");
+
+    expect(result.rows).toHaveLength(2);
+    expect(result.rows.map((row) => [row.sourceSheet, row.sourceRowNumber])).toEqual([["银行A", 2], ["银行B", 2]]);
+  });
+
+  it("使用逐工作表列索引映射识别非标准银行表头", async () => {
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("账户流水");
+    sheet.addRow(["记账日", "流入金额", "付款方名称", "用途说明"]);
+    sheet.addRow(["2026-08-03", "250.00", "合成往来方", "合成用途"]);
+
+    const result = await parseFinanceWorkbook(
+      Buffer.from(await workbook.xlsx.writeBuffer()),
+      "synthetic-bank.xlsx",
+      "BANK_STATEMENT",
+      undefined,
+      { "账户流水": { occurredAt: 0, amount: 1, counterparty: 2, description: 3 } }
+    );
+
+    expect(result.rows).toMatchObject([{
+      sourceSheet: "账户流水",
+      sourceRowNumber: 2,
+      occurredAt: "2026-08-03",
+      amount: "250.00",
+      counterparty: "合成往来方",
+      description: "合成用途"
+    }]);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("借贷金额列已明确方向时忽略冗余金额说明列的非金额文本", () => {
+    const result = normalizeFinanceRow(
+      { 日期: "2026-08-01", 金额: "文本说明", 借方发生额: "", 贷方发生额: "100.00" },
+      { occurredAt: "日期", amount: "金额", debit: "借方发生额", credit: "贷方发生额" },
+      { sourceKind: "BANK_STATEMENT", sourceRowNumber: 2 }
+    );
+
+    expect(result).toMatchObject({ occurredAt: "2026-08-01", amount: "100.00", direction: "CREDIT" });
+    expect(result).not.toHaveProperty("code");
+  });
+
   it("工资资料按工资字段解析，不伪造银行交易日期和方向", async () => {
     const result = await parseFinanceSource(
       Buffer.from("月份,姓名,申报工资,实际支付,自担社保\n2026-08,合成人员甲,15000.00,12000.00,800.00", "utf8"),
@@ -119,6 +173,21 @@ describe("财务来源文件解析", () => {
       rows: [{ sourceRowNumber: 2, displayName: "合成人员甲", declaredSalary: "15000.00", actualCashPaid: "12000.00", selfCostDue: "800.00" }],
       errors: []
     });
+  });
+
+  it("解析薪资工作簿所有工作表并保留表名", async () => {
+    const workbook = new ExcelJS.Workbook();
+    const first = workbook.addWorksheet("律师");
+    first.addRow(["月份", "姓名", "申报工资", "实际支付", "自担社保"]);
+    first.addRow(["2026-08", "合成人员甲", "15000", "12000", "800"]);
+    const second = workbook.addWorksheet("行政");
+    second.addRow(["月份", "姓名", "申报工资", "实际支付", "自担社保"]);
+    second.addRow(["2026-08", "合成人员乙", "10000", "9500", "0"]);
+
+    const result = await parseFinanceSource(Buffer.from(await workbook.xlsx.writeBuffer()), "synthetic-payroll.xlsx", "PAYROLL");
+
+    expect(result.kind).toBe("PAYROLL");
+    expect(result.rows.map((row) => [row.sourceSheet, row.sourceRowNumber])).toEqual([["律师", 2], ["行政", 2]]);
   });
 
   it("花名册没有日期金额列时仍能解析，并要求显式截至日期", async () => {
@@ -177,6 +246,29 @@ describe("财务来源文件解析", () => {
     expect(result.kind).toBe("PAYROLL");
     expect(result.rows).toEqual([]);
     expect(result.errors[0]).toMatchObject({ rowNumber: 2, code: "INVALID_AMOUNT" });
+  });
+
+  it("工资表可按工作表列索引手工映射非标准字段名", async () => {
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("人员薪资");
+    sheet.addRow(["人员编号", "工资基数", "到账数", "个人成本"]);
+    sheet.addRow(["SYN-01", "15000", "12000", "800"]);
+
+    const result = await parseFinanceSource(
+      Buffer.from(await workbook.xlsx.writeBuffer()),
+      "synthetic-payroll.xlsx",
+      "PAYROLL",
+      {
+        period: "2026-08",
+        columnMappingsBySheet: { "人员薪资": { name: 0, salary: 1, actual: 2, selfCost: 3 } }
+      }
+    );
+
+    expect(result).toMatchObject({
+      kind: "PAYROLL",
+      rows: [{ sourceSheet: "人员薪资", sourceRowNumber: 2, displayName: "SYN-01", declaredSalary: "15000.00", actualCashPaid: "12000.00", selfCostDue: "800.00" }],
+      errors: []
+    });
   });
 
   it("传统 XLS 返回明确的转换提示，不调用不受信任的转换器", async () => {

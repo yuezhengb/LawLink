@@ -62,6 +62,7 @@ function asMoney(value: unknown): string {
 function sourceToNormalizedRow(source: {
   id: string;
   batchId: string;
+  sourceSheet?: string;
   sourceRow: number;
   occurredAt: Date;
   amount: unknown;
@@ -82,6 +83,7 @@ function sourceToNormalizedRow(source: {
     sourceKind,
     sourceBatchId: source.batchId,
     sourceFileId: undefined,
+    sourceSheet: source.sourceSheet ?? "",
     sourceRowNumber: source.sourceRow,
     occurredAt: shDayKey(source.occurredAt),
     amount: asMoney(source.amount),
@@ -432,7 +434,7 @@ export async function exportClaimDecisions(
     include: { sourceRow: true, claimDecisions: { orderBy: { createdAt: "desc" }, take: 1 } },
     orderBy: [{ createdAt: "asc" }, { id: "asc" }]
   });
-  const header = ["批次ID", "来源行ID（掩码）", "来源行号", "来源行指纹", "日期", "有符号金额", "候选付款ID（掩码）", "决定", "理由"];
+  const header = ["批次ID", "来源行ID（掩码）", "来源工作表", "来源行号", "来源行指纹", "日期", "有符号金额", "候选付款ID（掩码）", "决定", "理由"];
   const lines = cases.map((item) => {
     const row = sourceToNormalizedRow(item.sourceRow);
     const suggestions = suggestionsFromJson(item.suggestions);
@@ -440,6 +442,7 @@ export async function exportClaimDecisions(
     return [
       item.batchId,
       maskIdentifier(item.sourceRow.id),
+      item.sourceRow.sourceSheet,
       item.sourceRow.sourceRow,
       rowFingerprint(row),
       row.occurredAt,
@@ -497,6 +500,7 @@ export async function importClaimDecisions(
   if (rows.length < 2) throw new ActionError("决定文件没有数据行");
   const headers = rows[0].map((header) => header.trim().toLocaleLowerCase());
   const batchIndex = importHeaderIndex(headers, ["批次id", "batchid"]);
+  const sourceSheetIndex = importHeaderIndex(headers, ["来源工作表", "sourcesheet"]);
   const sourceRowIndex = importHeaderIndex(headers, ["来源行号", "sourcerow"]);
   const fingerprintIndex = importHeaderIndex(headers, ["来源行指纹", "rowfingerprint"]);
   const decisionIndex = importHeaderIndex(headers, ["决定", "decision"]);
@@ -512,6 +516,7 @@ export async function importClaimDecisions(
   let errors = 0;
   for (const values of rows.slice(1)) {
     const batchId = values[batchIndex]?.trim();
+    const sourceSheet = sourceSheetIndex >= 0 ? values[sourceSheetIndex]?.trim() ?? "" : "";
     const sourceRow = Number(values[sourceRowIndex]);
     const fingerprint = values[fingerprintIndex]?.trim();
     const decision = values[decisionIndex]?.trim().toUpperCase();
@@ -520,7 +525,7 @@ export async function importClaimDecisions(
       continue;
     }
     const source = await db.financeSourceRow.findUnique({
-      where: { batchId_sourceRow: { batchId, sourceRow } },
+      where: { batchId_sourceSheet_sourceRow: { batchId, sourceSheet, sourceRow } },
       include: { reconciliationCase: true }
     });
     if (!source?.reconciliationCase) {

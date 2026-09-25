@@ -1,4 +1,4 @@
-import type { FinanceExternalStatementImportRow, FinanceRowError } from "@/lib/finance/internal-types";
+import type { FinanceColumnMappingsBySheet, FinanceExternalStatementImportRow, FinanceRowError } from "@/lib/finance/internal-types";
 import { cell, columnIndex, onePeriod, parseMoney, parsePeriod, readTypedTable, rowError } from "@/lib/finance/typed-import-utils";
 
 function statementKind(value: string): FinanceExternalStatementImportRow["statement"] | null {
@@ -9,31 +9,31 @@ function statementKind(value: string): FinanceExternalStatementImportRow["statem
   return null;
 }
 
-export async function parseExternalStatementsWorkbook(bytes: Buffer, fileName: string, selectedPeriod?: string) {
-  const table = await readTypedTable(bytes, fileName, ["period", "statement", "item", "amount"]);
+export async function parseExternalStatementsWorkbook(bytes: Buffer, fileName: string, selectedPeriod?: string, mappingsBySheet: FinanceColumnMappingsBySheet = {}) {
+  const table = await readTypedTable(bytes, fileName, ["item", "amount"], mappingsBySheet);
   const errors: FinanceRowError[] = [...table.errors];
-  const periodIndex = columnIndex(table.headers, "period");
-  const statementIndex = columnIndex(table.headers, "statement");
-  const itemIndex = columnIndex(table.headers, "item");
-  const amountIndex = columnIndex(table.headers, "amount");
   const periods = table.rows.map((row) => {
+    const periodIndex = columnIndex(row.headers, "period", row.mapping);
     const raw = periodIndex >= 0 ? cell(row, periodIndex) : selectedPeriod ?? "";
     const period = parsePeriod(raw);
-    if (!period) errors.push(rowError(row.sourceRowNumber, raw ? "INVALID_PERIOD" : "MISSING_PERIOD", "外部三表行账期无效或缺失", "period"));
-    else if (selectedPeriod && selectedPeriod !== period) errors.push(rowError(row.sourceRowNumber, "INVALID_PERIOD", "文件账期与所选账期不一致", "period"));
+    if (!period) errors.push({ ...rowError(row.sourceRowNumber, raw ? "INVALID_PERIOD" : "MISSING_PERIOD", "外部三表行账期无效或缺失", "period"), sourceSheet: row.sourceSheet });
+    else if (selectedPeriod && selectedPeriod !== period) errors.push({ ...rowError(row.sourceRowNumber, "INVALID_PERIOD", "文件账期与所选账期不一致", "period"), sourceSheet: row.sourceSheet });
     return period ?? "";
   });
   const period = onePeriod(periods, table.rows.map((row) => row.sourceRowNumber), errors);
   const rows: FinanceExternalStatementImportRow[] = [];
   for (let index = 0; index < table.rows.length; index += 1) {
     const row = table.rows[index];
-    const statement = statementKind(cell(row, statementIndex));
+    const statementIndex = columnIndex(row.headers, "statement", row.mapping);
+    const itemIndex = columnIndex(row.headers, "item", row.mapping);
+    const amountIndex = columnIndex(row.headers, "amount", row.mapping);
+    const statement = statementKind(cell(row, statementIndex)) ?? statementKind(row.sourceSheet);
     const item = cell(row, itemIndex);
     const amount = parseMoney(cell(row, amountIndex), true);
-    if (!statement) errors.push(rowError(row.sourceRowNumber, "INVALID_STATEMENT", "报表类型须为资产负债表、利润表或现金流量表", "statement"));
-    if (!item) errors.push(rowError(row.sourceRowNumber, "INVALID_COLUMN_MAPPING", "外部三表行缺少项目/科目", "item"));
-    if (amount === null) errors.push(rowError(row.sourceRowNumber, "INVALID_AMOUNT", "金额格式无效，最多支持两位小数", "amount"));
-    if (period && statement && item && amount !== null) rows.push({ sourceRowNumber: row.sourceRowNumber, period, statement, item, amount });
+    if (!statement) errors.push({ ...rowError(row.sourceRowNumber, "INVALID_STATEMENT", "报表类型须为资产负债表、利润表或现金流量表", "statement"), sourceSheet: row.sourceSheet });
+    if (!item) errors.push({ ...rowError(row.sourceRowNumber, "INVALID_COLUMN_MAPPING", "外部三表行缺少项目/科目", "item"), sourceSheet: row.sourceSheet });
+    if (amount === null) errors.push({ ...rowError(row.sourceRowNumber, "INVALID_AMOUNT", "金额格式无效，最多支持两位小数", "amount"), sourceSheet: row.sourceSheet });
+    if (period && statement && item && amount !== null) rows.push({ sourceSheet: row.sourceSheet, sourceRowNumber: row.sourceRowNumber, period, statement, item, amount });
   }
   const present = new Set(rows.map((row) => row.statement));
   const missing = (["BALANCE_SHEET", "INCOME", "CASH_FLOW"] as const).filter((kind) => !present.has(kind));
@@ -45,6 +45,6 @@ export async function parseExternalStatementsWorkbook(bytes: Buffer, fileName: s
     errors,
     totalRows: table.totalRows,
     period: period ?? undefined,
-    reviewWarnings: missing.length ? [`尚未包含：${missing.map((kind) => kind === "BALANCE_SHEET" ? "资产负债表" : kind === "INCOME" ? "利润表" : "现金流量表").join("、")}；不得视为完整外部三表。`] : []
+    reviewWarnings: [...table.reviewWarnings, ...(missing.length ? [`尚未包含：${missing.map((kind) => kind === "BALANCE_SHEET" ? "资产负债表" : kind === "INCOME" ? "利润表" : "现金流量表").join("、")}；不得视为完整外部三表。`] : [])]
   };
 }

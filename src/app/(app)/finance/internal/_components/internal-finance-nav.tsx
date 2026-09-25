@@ -1,15 +1,18 @@
 import Link from "next/link";
-import { ArrowDownToLine, BarChart3, BookOpenCheck, CircleDollarSign, ClipboardCheck, FileArchive, Gauge } from "lucide-react";
+import { ArrowDownToLine, BarChart3, Bell, BookOpenCheck, CircleDollarSign, ClipboardCheck, FileArchive, Gauge, UsersRound } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-export type InternalFinanceNavKey = "overview" | "imports" | "reconciliation" | "ledger" | "reports" | "monthly-close";
+export type InternalFinanceNavKey = "overview" | "imports" | "reconciliation" | "counterparties" | "ledger" | "reports" | "settlements" | "notifications" | "monthly-close";
 
 const items: Array<{ key: InternalFinanceNavKey; label: string; description: string; href: string; icon: typeof Gauge }> = [
   { key: "overview", label: "财务总览", description: "本期闭环状态", href: "/finance/internal", icon: Gauge },
   { key: "imports", label: "银行流水与归档", description: "导入、留痕、下载", href: "/finance/internal/imports", icon: ArrowDownToLine },
   { key: "reconciliation", label: "待办认领与归类", description: "建议、确认、疑点", href: "/finance/internal/reconciliation", icon: ClipboardCheck },
+  { key: "counterparties", label: "往来单位透视", description: "来源指纹、收付与认领", href: "/finance/internal/counterparties", icon: UsersRound },
   { key: "ledger", label: "分成与个人内账", description: "人员、项目、规则", href: "/finance/internal/ledger", icon: CircleDollarSign },
   { key: "reports", label: "报表与核对", description: "经营成果与导出", href: "/finance/internal/ledger?view=reports", icon: BarChart3 },
+  { key: "settlements", label: "律师个人结算", description: "个人工作簿与受限交付", href: "/finance/internal/settlements", icon: BookOpenCheck },
+  { key: "notifications", label: "财务通知", description: "企微摘要预览与确认", href: "/finance/internal/notifications", icon: Bell },
   { key: "monthly-close", label: "月结与财务交付", description: "封账、调整、交付", href: "/finance/internal/monthly-close", icon: FileArchive }
 ];
 

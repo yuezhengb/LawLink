@@ -18,7 +18,7 @@ export async function POST(req: Request) {
     return NextResponse.json(result);
   } catch (caught) {
     if (caught instanceof ActionError) return NextResponse.json({ error: caught.message }, { status: 400 });
-    console.error("[finance-import/preview] 失败", caught);
+    console.error("[finance-import/preview] 失败（详细信息已省略）");
     return NextResponse.json({ error: "财务资料预览失败" }, { status: 500 });
   }
 }

@@ -52,6 +52,7 @@ describe("内部财务合成闭环验收", () => {
           .mockResolvedValueOnce(null)
           .mockResolvedValueOnce({ id: "synthetic-batch-1", status: "COMMITTED" })
       },
+      financeSourceRow: { findMany: vi.fn().mockResolvedValue([]) },
       $transaction: vi.fn(async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx))
     };
     const storage = { writeFile: vi.fn().mockResolvedValue("finance-imports/synthetic.bin"), readFile: vi.fn(), deleteFile: vi.fn() };

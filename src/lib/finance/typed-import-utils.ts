@@ -1,9 +1,9 @@
-import { readFinanceMatrix } from "@/lib/finance/import-parser";
-import type { FinanceRowError } from "@/lib/finance/internal-types";
+import { readFinanceWorkbookSheets } from "@/lib/finance/import-parser";
+import type { FinanceColumnMappingsBySheet, FinanceImportIndexMapping, FinanceRowError, FinanceTypedImportField } from "@/lib/finance/internal-types";
 
-export type TypedTableRow = { sourceRowNumber: number; values: string[] };
-export type TypedTable = { headers: string[]; rows: TypedTableRow[]; errors: FinanceRowError[]; totalRows: number };
-export type TypedField = "period" | "name" | "salary" | "actual" | "selfCost" | "role" | "statement" | "item" | "amount";
+export type TypedTableRow = { sourceSheet: string; sourceRowNumber: number; headers: string[]; values: string[]; mapping?: FinanceImportIndexMapping };
+export type TypedTable = { headers: string[]; rows: TypedTableRow[]; errors: FinanceRowError[]; totalRows: number; reviewWarnings: string[] };
+export type TypedField = FinanceTypedImportField;
 
 export const TYPED_ALIASES: Record<TypedField, readonly string[]> = {
   period: ["期间", "月份", "账期", "工资月份", "会计期间"],
@@ -21,34 +21,56 @@ function normalizeHeader(value: string): string {
   return value.replace(/[\s_\-]/g, "").replace(/[（）()]/g, "").toLocaleLowerCase();
 }
 
-export async function readTypedTable(bytes: Buffer, fileName: string, required: TypedField[]): Promise<TypedTable> {
-  const result = await readFinanceMatrix(bytes, fileName);
-  if (result.errors.length > 0) return { headers: [], rows: [], errors: result.errors, totalRows: 0 };
-  const matrix = result.matrix;
-  let headerIndex = -1;
-  let bestScore = -1;
-  const start = matrix.findIndex((row) => row.some((cell) => cell.trim().length > 0));
-  for (let index = start; index < Math.min(matrix.length, start + 20); index += 1) {
-    const candidate = new Set(matrix[index].map(normalizeHeader));
-    const score = required.reduce((count, field) => count + Number(TYPED_ALIASES[field].some((alias) => candidate.has(normalizeHeader(alias)))), 0);
-    if (score > bestScore) {
-      bestScore = score;
-      headerIndex = index;
+export async function readTypedTable(bytes: Buffer, fileName: string, required: TypedField[], mappingsBySheet: FinanceColumnMappingsBySheet = {}): Promise<TypedTable> {
+  const result = await readFinanceWorkbookSheets(bytes, fileName);
+  if (result.errors.length > 0) return { headers: [], rows: [], errors: result.errors, totalRows: 0, reviewWarnings: [] };
+  const tables: Array<{ sourceSheet: string; headers: string[]; rows: TypedTableRow[] }> = [];
+  const reviewWarnings: string[] = [];
+  const errors: FinanceRowError[] = [];
+  for (const sheet of result.sheets) {
+    const matrix = sheet.matrix;
+    let headerIndex = -1;
+    let bestScore = -1;
+    let bestDensity = -1;
+    const start = matrix.findIndex((row) => row.some((cell) => cell.trim().length > 0));
+    if (start < 0) continue;
+    for (let index = start; index < Math.min(matrix.length, start + 20); index += 1) {
+      const candidate = new Set(matrix[index].map(normalizeHeader));
+      const score = (Object.keys(TYPED_ALIASES) as TypedField[]).reduce((count, field) => count + Number(TYPED_ALIASES[field].some((alias) => candidate.has(normalizeHeader(alias)))), 0);
+      const density = matrix[index].filter((cell) => cell.trim().length > 0).length;
+      if (score > bestScore || (score === bestScore && density > bestDensity)) {
+        bestScore = score;
+        bestDensity = density;
+        headerIndex = index;
+      }
     }
+    const headers = headerIndex < 0 ? [] : matrix[headerIndex].map((value) => value.trim());
+    const explicitMapping = mappingsBySheet[sheet.name] ?? {};
+    const mappedOrDetected = (field: TypedField) => {
+      const index = explicitMapping[field];
+      return (Number.isInteger(index) && index! >= 0 && index! < headers.length) || TYPED_ALIASES[field].some((alias) => headers.some((header) => normalizeHeader(header) === normalizeHeader(alias)));
+    };
+    if (headerIndex < 0 || (required.some((field) => !mappedOrDetected(field)))) {
+      reviewWarnings.push(`工作表“${sheet.name}”未识别为所选资料类型，未计入结构化行。`);
+      continue;
+    }
+    const rows: TypedTableRow[] = [];
+    for (let index = headerIndex + 1; index < matrix.length; index += 1) {
+      const values = matrix[index];
+      if (values.some((cell) => cell.trim().length > 0)) rows.push({ sourceSheet: sheet.name, sourceRowNumber: index + 1, headers, values, mapping: explicitMapping });
+    }
+    tables.push({ sourceSheet: sheet.name, headers, rows });
   }
-  if (headerIndex < 0 || bestScore < required.length) {
-    return { headers: [], rows: [], errors: [{ rowNumber: Math.max(1, start + 1), code: "INVALID_COLUMN_MAPPING", message: "未识别到该类资料所需的表头" }], totalRows: 0 };
+  if (tables.length === 0) {
+    errors.push({ rowNumber: 1, code: "INVALID_COLUMN_MAPPING", message: "未识别到该类资料所需的表头" });
   }
-  const headers = matrix[headerIndex].map((value) => value.trim());
-  const rows: TypedTableRow[] = [];
-  for (let index = headerIndex + 1; index < matrix.length; index += 1) {
-    const values = matrix[index];
-    if (values.some((cell) => cell.trim().length > 0)) rows.push({ sourceRowNumber: index + 1, values });
-  }
-  return { headers, rows, errors: [], totalRows: rows.length };
+  const rows = tables.flatMap((table) => table.rows);
+  return { headers: tables[0]?.headers ?? [], rows, errors, totalRows: rows.length, reviewWarnings };
 }
 
-export function columnIndex(headers: string[], field: TypedField): number {
+export function columnIndex(headers: string[], field: TypedField, mapping?: FinanceImportIndexMapping): number {
+  const index = mapping?.[field];
+  if (Number.isInteger(index) && index! >= 0 && index! < headers.length) return index!;
   const aliases = new Set(TYPED_ALIASES[field].map(normalizeHeader));
   return headers.findIndex((header) => aliases.has(normalizeHeader(header)));
 }

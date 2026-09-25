@@ -1,15 +1,20 @@
-import { createHash } from "node:crypto";
+import ExcelJS from "exceljs";
 import { auditStrict as auditStrictDefault, auditTx } from "@/server/audit";
 import { requireSession } from "@/lib/auth/session";
 import { ActionError } from "@/lib/action-error";
 import { prisma } from "@/lib/prisma";
 import { storage as storageDefault, type StorageProvider } from "@/lib/storage";
 import { scopeFor, type RoleGrant } from "@/lib/roles/catalog";
-import { fileSha256, rowFingerprint } from "@/lib/finance/source-fingerprint";
+import { fileSha256, financeTypedRecordFingerprint, rowFingerprint } from "@/lib/finance/source-fingerprint";
 import { parseFinanceSource } from "@/lib/finance/finance-source-parser";
+import { inspectFinanceHeader, financeHeadersDigest } from "@/lib/finance/import-mapping";
+import { parseFinancePdfTables } from "@/lib/finance/pdf-table-parser";
+import { readFinanceWorkbookSheets } from "@/lib/finance/import-parser";
+import { preprocessFinanceUpload, type FinancePreprocessInput, type FinancePreprocessedUpload } from "@/server/finance/finance-preprocessor-client";
 import type {
   CommitFinanceImportInput,
   FinanceColumnMapping,
+  FinanceColumnMappingsBySheet,
   FinanceImportPreview,
   FinanceNormalizedRow,
   FinancePayrollImportRow,
@@ -17,10 +22,11 @@ import type {
   FinanceExternalStatementImportRow,
   FinanceSourceKind
 } from "@/lib/finance/internal-types";
-import type { Prisma, PrismaClient } from "@prisma/client";
+import { Prisma, type PrismaClient } from "@prisma/client";
 import {
   commitFinanceImportSchema,
   financeColumnMappingSchema,
+  financeColumnMappingsBySheetSchema,
   financeImportKindSchema,
   financePeriodSchema,
   MAX_FINANCE_IMPORT_BYTES,
@@ -38,6 +44,7 @@ export type FinanceImportDependencies = {
   storage?: StorageProvider;
   actorId?: string;
   auditStrict?: typeof auditStrictDefault;
+  preprocess?: (input: FinancePreprocessInput) => Promise<FinancePreprocessedUpload>;
 };
 
 export class FinanceImportNotFoundError extends Error {
@@ -59,9 +66,11 @@ function extensionOf(fileName: string): string {
 }
 
 function mimeTypeOf(fileName: string): string {
-  return extensionOf(fileName) === "csv"
-    ? "text/csv"
-    : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  const extension = extensionOf(fileName);
+  if (extension === "csv") return "text/csv";
+  if (extension === "pdf") return "application/pdf";
+  if (extension === "xls") return "application/vnd.ms-excel";
+  return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 }
 
 function safeFileName(fileName: string): string {
@@ -97,6 +106,21 @@ function parseMapping(formData: FormData): FinanceColumnMapping | undefined {
   return result.data;
 }
 
+function parseColumnMappingsBySheet(formData: FormData): FinanceColumnMappingsBySheet | undefined {
+  const value = formData.get("columnMappingsBySheet");
+  if (value === null || value === "") return undefined;
+  if (typeof value !== "string") throw new ActionError("列映射格式不正确");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new ActionError("列映射格式不正确");
+  }
+  const result = financeColumnMappingsBySheetSchema.safeParse(parsed);
+  if (!result.success) throw new ActionError("列映射格式不正确");
+  return result.data;
+}
+
 function parseKind(formData: FormData): FinanceSourceKind {
   const raw = formData.get("kind") ?? "BANK_STATEMENT";
   const result = financeImportKindSchema.safeParse(String(raw));
@@ -104,7 +128,7 @@ function parseKind(formData: FormData): FinanceSourceKind {
   return result.data;
 }
 
-async function readUpload(formData: FormData): Promise<{ fileName: string; bytes: Buffer; kind: FinanceSourceKind; mapping?: FinanceColumnMapping; period?: string; asOfDay?: string }> {
+async function readUpload(formData: FormData): Promise<{ fileName: string; bytes: Buffer; kind: FinanceSourceKind; mapping?: FinanceColumnMapping; columnMappingsBySheet?: FinanceColumnMappingsBySheet; period?: string; asOfDay?: string }> {
   const candidate = formData.get("file") ?? formData.get("sourceFile");
   if (!candidate || typeof candidate !== "object" || typeof (candidate as { arrayBuffer?: unknown }).arrayBuffer !== "function") {
     throw new ActionError("缺少财务资料文件");
@@ -112,11 +136,11 @@ async function readUpload(formData: FormData): Promise<{ fileName: string; bytes
   const file = candidate as { name?: unknown; arrayBuffer: () => Promise<ArrayBuffer> };
   const fileName = safeFileName(typeof file.name === "string" ? file.name : "finance-import");
   const extension = extensionOf(fileName);
-  if (extension !== "csv" && extension !== "xlsx" && extension !== "xls") {
-    throw new ActionError("仅支持 CSV 或 XLSX 文件；传统 XLS 请先转换为 XLSX");
+  if (extension !== "csv" && extension !== "xlsx" && extension !== "xls" && extension !== "pdf") {
+    throw new ActionError("仅支持 CSV、XLSX、XLS 或 PDF 文件");
   }
   const bytes = Buffer.from(await file.arrayBuffer());
-  if (bytes.byteLength > MAX_FINANCE_IMPORT_BYTES) {
+  if (bytes.byteLength === 0 || bytes.byteLength > MAX_FINANCE_IMPORT_BYTES) {
     throw new ActionError("财务资料不能超过 25 MB");
   }
   const rawPeriod = formData.get("period");
@@ -125,7 +149,107 @@ async function readUpload(formData: FormData): Promise<{ fileName: string; bytes
   const rawAsOfDay = formData.get("asOfDay");
   const asOfDay = rawAsOfDay === null || rawAsOfDay === "" ? undefined : String(rawAsOfDay);
   if (asOfDay && !/^\d{4}-\d{2}-\d{2}$/.test(asOfDay)) throw new ActionError("花名册截至日期格式不正确");
-  return { fileName, bytes, kind: parseKind(formData), mapping: parseMapping(formData), period: periodResult?.success ? periodResult.data : undefined, asOfDay };
+  return { fileName, bytes, kind: parseKind(formData), mapping: parseMapping(formData), columnMappingsBySheet: parseColumnMappingsBySheet(formData), period: periodResult?.success ? periodResult.data : undefined, asOfDay };
+}
+
+type FinanceUploadForParsing = {
+  fileName: string;
+  bytes: Buffer;
+  kind: FinanceSourceKind;
+  mapping?: FinanceColumnMapping;
+  columnMappingsBySheet?: FinanceColumnMappingsBySheet;
+  period?: string;
+  asOfDay?: string;
+};
+
+type PreparedFinanceSource = {
+  parseBytes: Buffer;
+  parseFileName: string;
+  pdfCandidates: FinanceImportPreview["pdfCandidates"];
+  canCommitStructuredRows: boolean;
+};
+
+async function pdfTablesToWorkbook(document: Extract<FinancePreprocessedUpload, { kind: "PDF" }>): Promise<PreparedFinanceSource> {
+  const parsed = parseFinancePdfTables(document.document);
+  const workbook = new ExcelJS.Workbook();
+  for (const table of parsed.sheets) {
+    const sheet = workbook.addWorksheet(table.name);
+    for (const row of table.rows) sheet.addRow(row);
+  }
+  return {
+    parseBytes: Buffer.from(await workbook.xlsx.writeBuffer()),
+    parseFileName: "finance-preprocessed.pdf.xlsx",
+    pdfCandidates: parsed.ocrCandidates.map((candidate) => ({
+      pageNumber: candidate.pageNumber,
+      extraction: candidate.extraction,
+      wordCount: candidate.words.length
+    })),
+    canCommitStructuredRows: parsed.canCommitStructuredRows
+  };
+}
+
+async function prepareFinanceSource(
+  upload: FinanceUploadForParsing,
+  preprocess: FinanceImportDependencies["preprocess"] = preprocessFinanceUpload
+): Promise<PreparedFinanceSource> {
+  const extension = extensionOf(upload.fileName);
+  if (upload.kind === "OTHER" && (extension === "xls" || extension === "pdf")) {
+    return { parseBytes: upload.bytes, parseFileName: upload.fileName, pdfCandidates: [], canCommitStructuredRows: true };
+  }
+  if (extension !== "xls" && extension !== "pdf") {
+    return { parseBytes: upload.bytes, parseFileName: upload.fileName, pdfCandidates: [], canCommitStructuredRows: true };
+  }
+  const processed = await preprocess({ fileName: upload.fileName, kind: upload.kind, bytes: upload.bytes });
+  return processed.kind === "XLSX" ? {
+    parseBytes: processed.bytes,
+    parseFileName: processed.fileName,
+    pdfCandidates: [],
+    canCommitStructuredRows: true
+  } : pdfTablesToWorkbook(processed);
+}
+
+function parseUnstructuredOtherSource(upload: FinanceUploadForParsing) {
+  return {
+    fileName: upload.fileName,
+    kind: "OTHER" as const,
+    headers: [],
+    rows: [],
+    errors: upload.period ? [] : [{ rowNumber: 0, code: "MISSING_PERIOD" as const, message: "归档其他资料时请指定账期" }],
+    totalRows: 1,
+    period: upload.period,
+    asOfDay: undefined,
+    reviewWarnings: ["该资料只保存原始文件，不提取为财务事实。"]
+  };
+}
+
+async function parseFinanceUpload(upload: FinanceUploadForParsing, dependencies: FinanceImportDependencies) {
+  const extension = extensionOf(upload.fileName);
+  const prepared = await prepareFinanceSource(upload, dependencies.preprocess);
+  const parsed = upload.kind === "OTHER" && (extension === "xls" || extension === "pdf")
+    ? parseUnstructuredOtherSource(upload)
+    : await parseFinanceSource(prepared.parseBytes, prepared.parseFileName, upload.kind, upload);
+  return { parsed, prepared };
+}
+
+async function financeSheetPreviews(
+  bytes: Buffer,
+  fileName: string,
+  kind: FinanceSourceKind,
+  explicitMappings: FinanceColumnMappingsBySheet | undefined
+): Promise<NonNullable<FinanceImportPreview["sheets"]>> {
+  if (kind === "OTHER") return [];
+  const workbook = await readFinanceWorkbookSheets(bytes, fileName);
+  if (workbook.errors.length) return [];
+  return workbook.sheets.flatMap((sheet) => {
+    const inspected = inspectFinanceHeader(kind, sheet.matrix);
+    if (!inspected) return [];
+    const mapping = { ...inspected.mapping, ...(explicitMappings?.[sheet.name] ?? {}) };
+    const missingFields = inspected.missingFields.filter((field) => mapping[field] === undefined);
+    if (kind === "BANK_STATEMENT" && (mapping.amount !== undefined || mapping.debit !== undefined || mapping.credit !== undefined)) {
+      return [{ sourceSheet: sheet.name, headers: inspected.headers, headerRowNumber: inspected.headerRowNumber, headersDigest: financeHeadersDigest(kind, inspected.headers), mapping, missingFields: missingFields.filter((field) => field !== "amount") }];
+    }
+    return [{ sourceSheet: sheet.name, headers: inspected.headers, headerRowNumber: inspected.headerRowNumber, headersDigest: financeHeadersDigest(kind, inspected.headers), mapping, missingFields }];
+  });
 }
 
 function maskedName(value: string): string {
@@ -141,8 +265,8 @@ function safePreviewRows(rows: FinanceImportPreview["rows"]): FinanceImportPrevi
         ...bankRow,
         sourceBatchId: undefined,
         sourceFileId: undefined,
-        counterparty: truncate(bankRow.counterparty, 160),
-        description: truncate(bankRow.description, 300)
+        counterparty: bankRow.counterparty ? maskedName(bankRow.counterparty) : null,
+        description: bankRow.description ? "已隐藏摘要" : null
       };
     }
     if ("displayName" in row) {
@@ -154,11 +278,11 @@ function safePreviewRows(rows: FinanceImportPreview["rows"]): FinanceImportPrevi
 
 export async function previewFinanceImport(
   formData: FormData,
-  _dependencies: FinanceImportDependencies = {}
+  dependencies: FinanceImportDependencies = {}
 ): Promise<FinanceImportPreview> {
-  void _dependencies;
   const upload = await readUpload(formData);
-  const result = await parseFinanceSource(upload.bytes, upload.fileName, upload.kind, upload);
+  const { parsed: result, prepared } = await parseFinanceUpload(upload, dependencies);
+  const sheets = await financeSheetPreviews(prepared.parseBytes, prepared.parseFileName, upload.kind, upload.columnMappingsBySheet);
   return {
     fileName: upload.fileName,
     kind: upload.kind,
@@ -169,7 +293,10 @@ export async function previewFinanceImport(
     totalRows: result.totalRows,
     reviewWarnings: result.reviewWarnings,
     period: result.period,
-    asOfDay: result.asOfDay
+    asOfDay: result.asOfDay,
+    sheets,
+    pdfCandidates: prepared.pdfCandidates,
+    canCommitStructuredRows: prepared.canCommitStructuredRows
   };
 }
 
@@ -177,6 +304,7 @@ function dataForSourceRow(row: FinanceNormalizedRow, batchId: string, sourceFile
   return {
     batchId,
     sourceFileId,
+    sourceSheet: row.sourceSheet ?? "",
     sourceRow: row.sourceRowNumber,
     occurredAt: dayStartInShanghai(row.occurredAt),
     amount: row.amount,
@@ -193,10 +321,6 @@ function dataForSourceRow(row: FinanceNormalizedRow, batchId: string, sourceFile
   };
 }
 
-function digestValue(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
-}
-
 function dataForTypedRecord(
   row: FinancePayrollImportRow | FinanceRosterImportRow | FinanceExternalStatementImportRow,
   kind: "PAYROLL" | "ROSTER" | "EXTERNAL_THREE_STATEMENTS",
@@ -204,44 +328,56 @@ function dataForTypedRecord(
 ): Prisma.FinanceImportRecordCreateManyInput {
   if (kind === "PAYROLL") {
     const payroll = row as FinancePayrollImportRow;
-    const normalized = { period: payroll.period, declaredSalary: payroll.declaredSalary, actualCashPaid: payroll.actualCashPaid, selfCostDue: payroll.selfCostDue };
+    const displayName = truncate(payroll.displayName, 120);
     return {
       batchId,
+      sourceSheet: payroll.sourceSheet ?? "",
       sourceRow: payroll.sourceRowNumber,
       kind,
+      displayName,
       period: payroll.period,
       declaredSalary: payroll.declaredSalary,
       actualCashPaid: payroll.actualCashPaid,
       selfCostDue: payroll.selfCostDue,
-      normalizedDigest: digestValue(normalized),
+      normalizedDigest: financeTypedRecordFingerprint(kind, {
+        displayName,
+        period: payroll.period,
+        declaredSalary: payroll.declaredSalary,
+        actualCashPaid: payroll.actualCashPaid,
+        selfCostDue: payroll.selfCostDue
+      }),
       reviewStatus: "NEEDS_REVIEW"
     };
   }
   if (kind === "ROSTER") {
     const roster = row as FinanceRosterImportRow;
-    const normalized = { asOfDay: roster.asOfDay, roleLabel: roster.roleLabel };
+    const displayName = truncate(roster.displayName, 120);
+    const roleLabel = truncate(roster.roleLabel, 100);
     return {
       batchId,
+      sourceSheet: roster.sourceSheet ?? "",
       sourceRow: roster.sourceRowNumber,
       kind,
+      displayName,
       period: roster.asOfDay.slice(0, 7),
       asOfDay: dayStartInShanghai(roster.asOfDay),
-      roleLabel: truncate(roster.roleLabel, 100),
-      normalizedDigest: digestValue(normalized),
+      roleLabel,
+      normalizedDigest: financeTypedRecordFingerprint(kind, { displayName, asOfDay: roster.asOfDay, roleLabel }),
       reviewStatus: "NEEDS_REVIEW"
     };
   }
   const statement = row as FinanceExternalStatementImportRow;
-  const normalized = { period: statement.period, statement: statement.statement, item: statement.item, amount: statement.amount };
+  const item = truncate(statement.item, 200);
   return {
     batchId,
+    sourceSheet: statement.sourceSheet ?? "",
     sourceRow: statement.sourceRowNumber,
     kind,
     period: statement.period,
     statement: statement.statement,
-    item: truncate(statement.item, 200),
+    item,
     amount: statement.amount,
-    normalizedDigest: digestValue(normalized),
+    normalizedDigest: financeTypedRecordFingerprint(kind, { period: statement.period, statement: statement.statement, item, amount: statement.amount }),
     reviewStatus: "NEEDS_REVIEW"
   };
 }
@@ -256,6 +392,55 @@ function periodBounds(period: string): { start: Date; end: Date } {
   };
 }
 
+function fingerprintFromMetadata(value: Prisma.JsonValue | null): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const fingerprint = (value as Prisma.JsonObject).rowFingerprint;
+  return typeof fingerprint === "string" ? fingerprint : null;
+}
+
+async function assertNoDuplicateStructuredRows(
+  db: Pick<PrismaClient, "financeSourceRow" | "financeImportRecord"> | Prisma.TransactionClient,
+  parsed: Awaited<ReturnType<typeof parseFinanceUpload>>["parsed"],
+  period: string
+): Promise<void> {
+  if (parsed.kind === "BANK_STATEMENT") {
+    const bounds = periodBounds(period);
+    const existing = await db.financeSourceRow.findMany({
+      where: {
+        occurredAt: { gte: bounds.start, lt: bounds.end },
+        batch: { kind: "BANK_STATEMENT", status: "COMMITTED" }
+      },
+      select: { metadata: true }
+    });
+    const existingFingerprints = new Set(existing.map((row) => fingerprintFromMetadata(row.metadata)));
+    const incomingFingerprints = parsed.rows.map(rowFingerprint);
+    if (
+      new Set(incomingFingerprints).size !== incomingFingerprints.length ||
+      incomingFingerprints.some((fingerprint) => existingFingerprints.has(fingerprint))
+    ) {
+      throw new ActionError("该文件包含已导入的重复流水行，请先核对来源后再导入");
+    }
+    return;
+  }
+
+  if (parsed.kind === "PAYROLL" || parsed.kind === "ROSTER" || parsed.kind === "EXTERNAL_THREE_STATEMENTS") {
+    const normalizedRows = parsed.rows.map((row) => dataForTypedRecord(row, parsed.kind, "pending"));
+    const candidates = normalizedRows.map((row) => row.normalizedDigest);
+    const periods = [...new Set(normalizedRows.map((row) => row.period ?? period))];
+    const existing = await db.financeImportRecord.findMany({
+      where: { kind: parsed.kind, period: { in: periods }, normalizedDigest: { in: candidates } },
+      select: { normalizedDigest: true }
+    });
+    const existingDigests = new Set(existing.map((row) => row.normalizedDigest));
+    if (
+      new Set(candidates).size !== candidates.length ||
+      candidates.some((digest) => existingDigests.has(digest))
+    ) {
+      throw new ActionError("该文件包含已导入的重复财务记录，请先核对来源后再导入");
+    }
+  }
+}
+
 export async function commitFinanceImport(
   input: CommitFinanceImportInput,
   dependencies: FinanceImportDependencies = {}
@@ -266,7 +451,8 @@ export async function commitFinanceImport(
   if (data.bytes.byteLength > MAX_FINANCE_IMPORT_BYTES) throw new ActionError("财务资料不能超过 25 MB");
 
   const fileName = safeFileName(data.fileName);
-  const parsed = await parseFinanceSource(data.bytes, fileName, data.kind, data);
+  const { parsed, prepared } = await parseFinanceUpload({ ...data, fileName }, dependencies);
+  if (!prepared.canCommitStructuredRows) throw new ActionError("PDF 页面未能形成稳定表格；请人工整理后再导入");
   if (parsed.totalRows === 0) throw new ActionError("文件中没有可提交的数据行");
   if (parsed.errors.length > 0) {
     throw new ActionError(`导入未提交：有 ${parsed.errors.length} 行需要先修正`);
@@ -281,9 +467,6 @@ export async function commitFinanceImport(
   if (existing?.status === "COMMITTED") return { batchId: existing.id, duplicate: true };
   if (existing) throw new ActionError("该文件已有未完成的导入批次，请先处理原批次");
 
-  const actorId = dependencies.actorId ?? (await requireSession("finance.import")).user.id;
-  const storageProvider = dependencies.storage ?? storageDefault;
-  const storagePath = await storageProvider.writeFile("finance-imports", data.bytes);
   let period: string | undefined;
   if (parsed.kind === "BANK_STATEMENT") {
     const occurredDays = parsed.rows.map((row) => row.occurredAt).sort();
@@ -296,8 +479,14 @@ export async function commitFinanceImport(
   if (!period) throw new ActionError("无法确定资料账期，请选择或填写 YYYY-MM");
   const { start: periodStart, end: periodEnd } = periodBounds(period);
 
+  await assertNoDuplicateStructuredRows(db, parsed, period);
+  const actorId = dependencies.actorId ?? (await requireSession("finance.import")).user.id;
+  const storageProvider = dependencies.storage ?? storageDefault;
+  const storagePath = await storageProvider.writeFile("finance-imports", data.bytes);
+
   try {
     const committed = await db.$transaction(async (tx) => {
+      await assertNoDuplicateStructuredRows(tx, parsed, period!);
       const batch = await tx.financeImportBatch.create({
         data: {
           sourceHash,
@@ -357,13 +546,13 @@ export async function commitFinanceImport(
         }
       });
       return batch;
-    });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     return { batchId: committed.id, duplicate: false };
   } catch (caught) {
     try {
       await storageProvider.deleteFile(storagePath);
-    } catch (cleanupError) {
-      console.error("[finance-import] 事务失败后清理来源文件失败", cleanupError);
+    } catch {
+      console.error("[finance-import] 事务失败后清理来源文件失败（详细信息已省略）");
     }
     throw caught;
   }

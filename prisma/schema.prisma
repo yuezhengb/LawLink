@@ -457,6 +457,7 @@ model User {
   confirmedFinanceCorrections FinanceCorrection[] @relation("FinanceCorrectionConfirmer")
   financeImportBatchesCreated FinanceImportBatch[] @relation("FinanceImportBatchCreator")
   financeImportRecordsResolved FinanceImportRecord[] @relation("FinanceImportRecordResolvedUser")
+  financeImportMappingTemplatesCreated FinanceImportMappingTemplate[] @relation("FinanceImportMappingTemplateCreator")
   financeClaimDecisions FinanceClaimDecision[] @relation("FinanceClaimDecisionDecider")
   financeMatterProfilesUpdated FinanceMatterProfile[] @relation("FinanceMatterProfileUpdater")
   financeRuleSetsCreated FinanceRuleSet[] @relation("FinanceRuleSetCreator")
@@ -3208,6 +3209,7 @@ model FinanceSourceRow {
   batch FinanceImportBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
   sourceFileId String
   sourceFile FinanceSourceFile @relation(fields: [sourceFileId], references: [id], onDelete: Restrict)
+  sourceSheet String @default("")
   sourceRow Int
   occurredAt DateTime
   amount Decimal @db.Decimal(14, 2)
@@ -3226,7 +3228,7 @@ model FinanceSourceRow {
   operatingCosts FinanceOperatingCost[]
   createdAt DateTime @default(now())
 
-  @@unique([batchId, sourceRow])
+  @@unique([batchId, sourceSheet, sourceRow])
   @@index([sourceFileId, sourceRow])
   @@index([occurredAt])
 }
@@ -3402,10 +3404,12 @@ model FinanceImportRecord {
   id String @id @default(cuid())
   batchId String
   batch FinanceImportBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  sourceSheet String @default("")
   sourceRow Int
   kind FinanceImportKind
   period String? @db.VarChar(7)
   asOfDay DateTime?
+  displayName String? @db.VarChar(120)
   roleLabel String? @db.VarChar(100)
   statement FinanceExternalStatementKind?
   item String? @db.VarChar(200)
@@ -3419,9 +3423,23 @@ model FinanceImportRecord {
   reviewStatus FinanceImportReviewStatus @default(NEEDS_REVIEW)
   createdAt DateTime @default(now())
 
-  @@unique([batchId, sourceRow])
+  @@unique([batchId, sourceSheet, sourceRow])
   @@index([period, kind, reviewStatus])
   @@index([resolvedUserId])
+}
+
+model FinanceImportMappingTemplate {
+  id String @id @default(cuid())
+  kind FinanceImportKind
+  headersDigest String @db.VarChar(64)
+  mapping Json
+  createdById String
+  createdBy User @relation("FinanceImportMappingTemplateCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([kind, headersDigest])
+  @@index([createdById, createdAt])
 }
 
 model FinanceAllocationRecipient {
