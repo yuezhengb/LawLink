@@ -6,7 +6,7 @@ import {
 } from "@/server/finance/private-finance-import-actor";
 
 describe("受控财务导入审计主体", () => {
-  it("只创建停用且无系统角色的专用审计账户，并且不返回口令", async () => {
+  it("只创建停用且无系统角色的低权限审计账户，并且不返回口令", async () => {
     const create = vi.fn().mockResolvedValue({ id: "synthetic-import-actor" });
     const db = { user: { findUnique: vi.fn().mockResolvedValue(null), create } };
     const hashPassword = vi.fn().mockResolvedValue("synthetic-password-hash");
@@ -20,7 +20,7 @@ describe("受控财务导入审计主体", () => {
         name: PRIVATE_FINANCE_IMPORT_ACTOR_NAME,
         email: PRIVATE_FINANCE_IMPORT_ACTOR_EMAIL,
         passwordHash: "synthetic-password-hash",
-        role: "CUSTOM",
+        role: "ASSISTANT",
         roleDefinitionId: null,
         systemRole: "NONE",
         active: false
@@ -37,7 +37,7 @@ describe("受控财务导入审计主体", () => {
         findUnique: vi.fn().mockResolvedValue({
           id: "synthetic-import-actor",
           name: PRIVATE_FINANCE_IMPORT_ACTOR_NAME,
-          role: "CUSTOM",
+          role: "ASSISTANT",
           roleDefinitionId: null,
           systemRole: "NONE",
           active: false

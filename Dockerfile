@@ -35,6 +35,7 @@ COPY --from=builder --chown=nextjs:nodejs /app/package.json ./package.json
 COPY --from=builder --chown=nextjs:nodejs /app/prisma ./prisma
 COPY --from=builder --chown=nextjs:nodejs /app/src/lib ./src/lib
 COPY --from=builder --chown=nextjs:nodejs /app/src/server/finance ./src/server/finance
+COPY --from=builder --chown=nextjs:nodejs /app/src/server/auth/totp-login.ts ./src/server/auth/totp-login.ts
 COPY --from=builder --chown=nextjs:nodejs /app/src/server/audit.ts ./src/server/audit.ts
 COPY --from=builder --chown=nextjs:nodejs /app/tsconfig.json ./tsconfig.json
 COPY --from=builder --chown=nextjs:nodejs /app/next.config.mjs ./next.config.mjs
@@ -46,6 +47,7 @@ RUN test -f .next-build/BUILD_ID \
     && test -f next.config.mjs \
     && test -f src/lib/template-builder.ts \
     && test -f src/server/finance/private-finance-import-actor.ts \
+    && test -f src/server/auth/totp-login.ts \
     && test -f scripts/finance-import-private-commit.ts \
     && test -f tsconfig.json
 
