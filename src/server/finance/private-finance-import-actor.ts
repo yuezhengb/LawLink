@@ -20,7 +20,7 @@ export async function ensurePrivateFinanceImportActor(
   if (existing) {
     if (
       existing.name !== PRIVATE_FINANCE_IMPORT_ACTOR_NAME ||
-      existing.role !== "CUSTOM" ||
+      existing.role !== "ASSISTANT" ||
       existing.roleDefinitionId !== null ||
       existing.systemRole !== "NONE" ||
       existing.active
@@ -36,7 +36,7 @@ export async function ensurePrivateFinanceImportActor(
       name: PRIVATE_FINANCE_IMPORT_ACTOR_NAME,
       email: PRIVATE_FINANCE_IMPORT_ACTOR_EMAIL,
       passwordHash,
-      role: "CUSTOM",
+      role: "ASSISTANT",
       roleDefinitionId: null,
       systemRole: "NONE",
       active: false
