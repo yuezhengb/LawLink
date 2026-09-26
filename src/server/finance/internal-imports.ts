@@ -70,8 +70,12 @@ function mimeTypeOf(fileName: string): string {
   if (extension === "csv") return "text/csv";
   if (extension === "pdf") return "application/pdf";
   if (extension === "xls") return "application/vnd.ms-excel";
+  if (extension === "xlsm") return "application/vnd.ms-excel.sheet.macroEnabled.12";
   return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 }
+
+const SUPPORTED_SOURCE_EXTENSIONS = new Set(["csv", "xlsx", "xlsm", "xls", "pdf"]);
+const SUPPORTED_SOURCE_EXTENSIONS_MESSAGE = "仅支持 CSV、XLSX、XLSM、XLS 或 PDF 文件";
 
 function safeFileName(fileName: string): string {
   const normalized = fileName
@@ -136,8 +140,8 @@ async function readUpload(formData: FormData): Promise<{ fileName: string; bytes
   const file = candidate as { name?: unknown; arrayBuffer: () => Promise<ArrayBuffer> };
   const fileName = safeFileName(typeof file.name === "string" ? file.name : "finance-import");
   const extension = extensionOf(fileName);
-  if (extension !== "csv" && extension !== "xlsx" && extension !== "xls" && extension !== "pdf") {
-    throw new ActionError("仅支持 CSV、XLSX、XLS 或 PDF 文件");
+  if (!SUPPORTED_SOURCE_EXTENSIONS.has(extension)) {
+    throw new ActionError(SUPPORTED_SOURCE_EXTENSIONS_MESSAGE);
   }
   const bytes = Buffer.from(await file.arrayBuffer());
   if (bytes.byteLength === 0 || bytes.byteLength > MAX_FINANCE_IMPORT_BYTES) {
@@ -214,8 +218,8 @@ function parseUnstructuredOtherSource(upload: FinanceUploadForParsing) {
     kind: "OTHER" as const,
     headers: [],
     rows: [],
-    errors: upload.period ? [] : [{ rowNumber: 0, code: "MISSING_PERIOD" as const, message: "归档其他资料时请指定账期" }],
-    totalRows: 1,
+    errors: [],
+    totalRows: 0,
     period: upload.period,
     asOfDay: undefined,
     reviewWarnings: ["该资料只保存原始文件，不提取为财务事实。"]
@@ -224,10 +228,26 @@ function parseUnstructuredOtherSource(upload: FinanceUploadForParsing) {
 
 async function parseFinanceUpload(upload: FinanceUploadForParsing, dependencies: FinanceImportDependencies) {
   const extension = extensionOf(upload.fileName);
+  if (upload.kind === "OTHER") {
+    const rawOnly = () => ({
+      parsed: parseUnstructuredOtherSource(upload),
+      prepared: {
+        parseBytes: upload.bytes,
+        parseFileName: upload.fileName,
+        pdfCandidates: [],
+        canCommitStructuredRows: true
+      }
+    });
+    if (extension === "xls" || extension === "pdf") return rawOnly();
+
+    const prepared = await prepareFinanceSource(upload, dependencies.preprocess);
+    const parsed = await parseFinanceSource(prepared.parseBytes, prepared.parseFileName, upload.kind, upload);
+    if (parsed.errors.length === 0) return { parsed, prepared };
+    return rawOnly();
+  }
+
   const prepared = await prepareFinanceSource(upload, dependencies.preprocess);
-  const parsed = upload.kind === "OTHER" && (extension === "xls" || extension === "pdf")
-    ? parseUnstructuredOtherSource(upload)
-    : await parseFinanceSource(prepared.parseBytes, prepared.parseFileName, upload.kind, upload);
+  const parsed = await parseFinanceSource(prepared.parseBytes, prepared.parseFileName, upload.kind, upload);
   return { parsed, prepared };
 }
 
@@ -451,9 +471,12 @@ export async function commitFinanceImport(
   if (data.bytes.byteLength > MAX_FINANCE_IMPORT_BYTES) throw new ActionError("财务资料不能超过 25 MB");
 
   const fileName = safeFileName(data.fileName);
+  if (!SUPPORTED_SOURCE_EXTENSIONS.has(extensionOf(fileName))) {
+    throw new ActionError(SUPPORTED_SOURCE_EXTENSIONS_MESSAGE);
+  }
   const { parsed, prepared } = await parseFinanceUpload({ ...data, fileName }, dependencies);
   if (!prepared.canCommitStructuredRows) throw new ActionError("PDF 页面未能形成稳定表格；请人工整理后再导入");
-  if (parsed.totalRows === 0) throw new ActionError("文件中没有可提交的数据行");
+  if (parsed.totalRows === 0 && parsed.kind !== "OTHER") throw new ActionError("文件中没有可提交的数据行");
   if (parsed.errors.length > 0) {
     throw new ActionError(`导入未提交：有 ${parsed.errors.length} 行需要先修正`);
   }
@@ -476,17 +499,17 @@ export async function commitFinanceImport(
   } else {
     period = parsed.period ?? data.period ?? (parsed.kind === "ROSTER" ? parsed.asOfDay?.slice(0, 7) : undefined);
   }
-  if (!period) throw new ActionError("无法确定资料账期，请选择或填写 YYYY-MM");
-  const { start: periodStart, end: periodEnd } = periodBounds(period);
+  if (!period && parsed.kind !== "OTHER") throw new ActionError("无法确定资料账期，请选择或填写 YYYY-MM");
+  const { start: periodStart, end: periodEnd } = period ? periodBounds(period) : { start: null, end: null };
 
-  await assertNoDuplicateStructuredRows(db, parsed, period);
+  if (parsed.kind !== "OTHER") await assertNoDuplicateStructuredRows(db, parsed, period!);
   const actorId = dependencies.actorId ?? (await requireSession("finance.import")).user.id;
   const storageProvider = dependencies.storage ?? storageDefault;
   const storagePath = await storageProvider.writeFile("finance-imports", data.bytes);
 
   try {
     const committed = await db.$transaction(async (tx) => {
-      await assertNoDuplicateStructuredRows(tx, parsed, period!);
+      if (parsed.kind !== "OTHER") await assertNoDuplicateStructuredRows(tx, parsed, period!);
       const batch = await tx.financeImportBatch.create({
         data: {
           sourceHash,
@@ -586,9 +609,20 @@ export async function downloadFinanceImportSource(
   if (!batch || batch.status !== "COMMITTED" || !batch.sourceFile) throw new FinanceImportNotFoundError();
   if (!canReadFinanceImport(viewer, batch)) throw new FinanceImportForbiddenError();
 
+  const strictAudit = dependencies.auditStrict ?? auditStrictDefault;
+  await strictAudit({
+    userId: viewer.id,
+    action: "FINANCE_INTERNAL_IMPORT_SOURCE_DOWNLOAD_ATTEMPT",
+    targetType: "FinanceImportBatch",
+    targetId: batch.id,
+    detail: {
+      kind: batch.kind,
+      fileExtension: extensionOf(batch.sourceFile.fileName)
+    }
+  });
+
   const storageProvider = dependencies.storage ?? storageDefault;
   const bytes = await storageProvider.readFile(batch.sourceFile.storagePath);
-  const strictAudit = dependencies.auditStrict ?? auditStrictDefault;
   await strictAudit({
     userId: viewer.id,
     action: "FINANCE_INTERNAL_IMPORT_SOURCE_DOWNLOAD",
@@ -601,4 +635,136 @@ export async function downloadFinanceImportSource(
     }
   });
   return { bytes, fileName: batch.sourceFile.fileName, mimeType: batch.sourceFile.mimeType };
+}
+
+const SOURCE_PREVIEW_PAGE_SIZE = 100;
+
+export type FinanceImportSourcePreview = {
+  fileName: string;
+  kind: string;
+  extension: string;
+  available: boolean;
+  unavailableReason: string | null;
+  sheetCount: number;
+  selectedSheet: {
+    index: number;
+    name: string;
+    totalRows: number;
+    page: number;
+    pageSize: number;
+    totalPages: number;
+    rows: Array<{ sourceRow: number; cells: string[] }>;
+  } | null;
+  ocrCandidatePages: number[];
+};
+
+type FinanceSourcePreviewOptions = { sheetIndex?: number; page?: number };
+
+export async function previewFinanceImportSource(
+  id: string,
+  viewer: FinanceImportViewer,
+  options: FinanceSourcePreviewOptions = {},
+  dependencies: FinanceImportDependencies = {}
+): Promise<FinanceImportSourcePreview> {
+  const parsedId = sourceDownloadSchema.safeParse({ id });
+  if (!parsedId.success) throw new FinanceImportNotFoundError();
+  const db = dependencies.db ?? prisma;
+  const batch = await db.financeImportBatch.findUnique({
+    where: { id: parsedId.data.id },
+    include: { sourceFile: true }
+  });
+  if (!batch || batch.status !== "COMMITTED" || !batch.sourceFile) throw new FinanceImportNotFoundError();
+  if (!canReadFinanceImport(viewer, batch)) throw new FinanceImportForbiddenError();
+
+  const fileName = batch.sourceFile.fileName;
+  const extension = extensionOf(fileName);
+  const base = {
+    fileName,
+    kind: String(batch.kind),
+    extension,
+    ocrCandidatePages: [] as number[]
+  };
+  const requestedSheet = Number.isInteger(options.sheetIndex) && (options.sheetIndex ?? -1) >= 0
+    ? Math.min(options.sheetIndex as number, 1000)
+    : 0;
+  const requestedPage = Number.isInteger(options.page) && (options.page ?? 0) > 0
+    ? Math.min(options.page as number, 10000)
+    : 1;
+  const strictAudit = dependencies.auditStrict ?? auditStrictDefault;
+  await strictAudit({
+    userId: viewer.id,
+    action: "FINANCE_INTERNAL_IMPORT_SOURCE_PREVIEW",
+    targetType: "FinanceImportBatch",
+    targetId: batch.id,
+    detail: {
+      kind: batch.kind,
+      fileExtension: extension,
+      sheetIndex: requestedSheet,
+      page: requestedPage
+    }
+  });
+
+  const unavailable = (unavailableReason: string): FinanceImportSourcePreview => ({
+    ...base,
+    available: false,
+    unavailableReason,
+    sheetCount: 0,
+    selectedSheet: null
+  });
+
+  if (!(extension === "csv" || extension === "xlsx" || extension === "xlsm" || extension === "xls" || extension === "pdf")) {
+    return unavailable("此文件类型暂不支持在线表格预览，请下载原件查看。");
+  }
+
+  const storageProvider = dependencies.storage ?? storageDefault;
+  const bytes = await storageProvider.readFile(batch.sourceFile.storagePath);
+  let sheets: Array<{ name: string; matrix: string[][] }> = [];
+  let ocrCandidatePages: number[] = [];
+  if (extension === "xls" || extension === "pdf") {
+    const preprocess = dependencies.preprocess ?? preprocessFinanceUpload;
+    const processed = await preprocess({ fileName, kind: "OTHER", bytes });
+    if (processed.kind === "XLSX") {
+      const workbook = await readFinanceWorkbookSheets(processed.bytes, processed.fileName);
+      if (workbook.errors.length > 0) return unavailable("来源表格无法读取，请下载原件人工核对。");
+      sheets = workbook.sheets;
+    } else {
+      const parsed = parseFinancePdfTables(processed.document);
+      sheets = parsed.sheets.map((sheet) => ({ name: sheet.name, matrix: sheet.rows }));
+      ocrCandidatePages = parsed.ocrCandidates.map((candidate) => candidate.pageNumber);
+    }
+  } else {
+    const workbook = await readFinanceWorkbookSheets(bytes, fileName);
+    if (workbook.errors.length > 0) return unavailable("来源表格无法读取，请下载原件人工核对。");
+    sheets = workbook.sheets;
+  }
+
+  if (sheets.length === 0) return unavailable("文件中没有可在线预览的表格；请下载原件查看。");
+
+  const sheetIndex = Math.min(requestedSheet, sheets.length - 1);
+  const sheet = sheets[sheetIndex];
+  const totalRows = sheet.matrix.length;
+  const totalPages = Math.max(1, Math.ceil(totalRows / SOURCE_PREVIEW_PAGE_SIZE));
+  const page = Math.min(requestedPage, totalPages);
+  const start = (page - 1) * SOURCE_PREVIEW_PAGE_SIZE;
+  const rows = sheet.matrix.slice(start, start + SOURCE_PREVIEW_PAGE_SIZE).map((cells, index) => ({
+    sourceRow: start + index + 1,
+    cells
+  }));
+
+  return {
+    ...base,
+    available: true,
+    unavailableReason: null,
+    sheetCount: sheets.length,
+    selectedSheet: {
+      index: sheetIndex,
+      name: sheet.name,
+      totalRows,
+      page,
+      pageSize: SOURCE_PREVIEW_PAGE_SIZE,
+      totalPages,
+      rows
+    },
+    ocrCandidatePages
+  };
 }

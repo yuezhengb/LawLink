@@ -8,6 +8,7 @@ import {
   canReadFinanceImport,
   commitFinanceImport,
   downloadFinanceImportSource,
+  previewFinanceImportSource,
   previewFinanceImport,
   type FinanceImportDependencies
 } from "@/server/finance/internal-imports";
@@ -40,6 +41,13 @@ async function twoSheetBankBytes(): Promise<Buffer> {
     sheet.addRow(["日期", "对方户名", "贷方发生额"]);
     sheet.addRow([day, "合成客户", amount]);
   }
+  return Buffer.from(await workbook.xlsx.writeBuffer());
+}
+
+async function twoSheetOtherArchiveBytes(): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook();
+  workbook.addWorksheet("登记A").addRows([["编号", "说明"], ["A-1", "synthetic one"], ["A-2", "synthetic two"]]);
+  workbook.addWorksheet("登记B").addRows([["编号", "说明"], ["B-1", "synthetic three"]]);
   return Buffer.from(await workbook.xlsx.writeBuffer());
 }
 
@@ -206,6 +214,137 @@ describe("内部财务资料导入", () => {
     expect(result.canCommitStructuredRows).toBe(false);
     expect(JSON.stringify(result)).not.toContain("合成候选");
     expect(storage.writeFile).not.toHaveBeenCalled();
+  });
+
+  it("其他来源可在账期未知时只归档原件并统计所有工作表行", async () => {
+    const { db, tx } = transactionDb();
+    db.financeImportBatch.findUnique.mockResolvedValue(null);
+    const storage = storageMock();
+
+    await expect(commitFinanceImport({
+      fileName: "case-register-snapshot.xlsm",
+      kind: "OTHER",
+      bytes: await twoSheetOtherArchiveBytes()
+    }, depsFor(db, storage))).resolves.toMatchObject({ duplicate: false, batchId: "batch-new" });
+
+    expect(tx.financeImportBatch.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ rowCount: 3, periodStart: null, periodEnd: null, kind: "OTHER" })
+    }));
+    expect(tx.financeSourceRow.createMany).not.toHaveBeenCalled();
+    expect(tx.financeImportRecord.createMany).not.toHaveBeenCalled();
+    expect(storage.writeFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("OTHER 工作簿无法解析时仍只保存原件，不制造财务事实", async () => {
+    const { db, tx } = transactionDb();
+    db.financeImportBatch.findUnique.mockResolvedValue(null);
+    const storage = storageMock();
+
+    await expect(commitFinanceImport({
+      fileName: "synthetic-unreadable.xlsx",
+      kind: "OTHER",
+      bytes: Buffer.from("synthetic invalid workbook bytes")
+    }, depsFor(db, storage))).resolves.toMatchObject({ duplicate: false, batchId: "batch-new" });
+
+    expect(tx.financeImportBatch.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ rowCount: 0, periodStart: null, periodEnd: null, kind: "OTHER" })
+    }));
+    expect(tx.financeSourceRow.createMany).not.toHaveBeenCalled();
+    expect(tx.financeReconciliationCase.createMany).not.toHaveBeenCalled();
+    expect(tx.financeImportRecord.createMany).not.toHaveBeenCalled();
+    expect(storage.writeFile).toHaveBeenCalledOnce();
+  });
+
+  it("原件归档兜底仍拒绝不支持的文件扩展名", async () => {
+    const { db } = transactionDb();
+    const storage = storageMock();
+
+    await expect(commitFinanceImport({
+      fileName: "synthetic-unknown.exe",
+      kind: "OTHER",
+      bytes: Buffer.from("synthetic bytes")
+    }, depsFor(db, storage))).rejects.toThrow("仅支持 CSV、XLSX、XLSM、XLS 或 PDF 文件");
+
+    expect(db.financeImportBatch.findUnique).not.toHaveBeenCalled();
+    expect(storage.writeFile).not.toHaveBeenCalled();
+  });
+
+  it("有财务读取权限的人可分页查看只读来源表格且审计不记录单元格内容", async () => {
+    const bytes = await twoSheetOtherArchiveBytes();
+    const batch = {
+      id: "batch-source",
+      kind: "OTHER",
+      status: "COMMITTED",
+      createdById: "finance-user",
+      sourceFile: {
+        fileName: "case-register-snapshot.xlsm",
+        storagePath: "finance-imports/202609/source.bin",
+        mimeType: "application/vnd.ms-excel.sheet.macroEnabled.12",
+        byteSize: bytes.byteLength
+      }
+    };
+    const db = { financeImportBatch: { findUnique: vi.fn().mockResolvedValue(batch) } };
+    const storage = { ...storageMock(), readFile: vi.fn().mockResolvedValue(bytes) };
+    const auditStrict = vi.fn().mockResolvedValue(undefined);
+
+    const result = await previewFinanceImportSource("batch-source", { id: "finance-user", role: "FINANCE" }, { sheetIndex: 1, page: 1 }, {
+      db: db as never,
+      storage,
+      auditStrict
+    });
+
+    expect(result).toMatchObject({
+      kind: "OTHER",
+      extension: "xlsm",
+      available: true,
+      selectedSheet: {
+        index: 1,
+        name: "登记B",
+        totalRows: 2,
+        page: 1,
+        rows: [{ sourceRow: 1, cells: ["编号", "说明"] }, { sourceRow: 2, cells: ["B-1", "synthetic three"] }]
+      }
+    });
+    expect(storage.readFile).toHaveBeenCalledTimes(1);
+    expect(auditStrict).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(auditStrict.mock.calls)).not.toContain("synthetic");
+  });
+
+  it("没有来源读取权限时不读取私有原件", async () => {
+    const bytes = await twoSheetOtherArchiveBytes();
+    const db = { financeImportBatch: { findUnique: vi.fn().mockResolvedValue({
+      id: "batch-source", kind: "OTHER", status: "COMMITTED", createdById: "finance-user",
+      sourceFile: { fileName: "private.xlsx", storagePath: "private.bin", mimeType: "application/octet-stream", byteSize: bytes.byteLength }
+    }) } };
+    const storage = { ...storageMock(), readFile: vi.fn().mockResolvedValue(bytes) };
+
+    await expect(previewFinanceImportSource("batch-source", { id: "other-user", role: "USER" }, {}, {
+      db: db as never,
+      storage
+    })).rejects.toThrow("无权访问该来源文件");
+    expect(storage.readFile).not.toHaveBeenCalled();
+  });
+
+  it("不支持在线预览的来源也记录访问审计，且不读取原件", async () => {
+    const db = { financeImportBatch: { findUnique: vi.fn().mockResolvedValue({
+      id: "batch-source", kind: "OTHER", status: "COMMITTED", createdById: "finance-user",
+      sourceFile: { fileName: "private.bin", storagePath: "private.bin", mimeType: "application/octet-stream", byteSize: 8 }
+    }) } };
+    const storage = { ...storageMock(), readFile: vi.fn() };
+    const auditStrict = vi.fn().mockResolvedValue(undefined);
+
+    const result = await previewFinanceImportSource("batch-source", { id: "finance-user", role: "FINANCE" }, {}, {
+      db: db as never,
+      storage,
+      auditStrict
+    });
+
+    expect(result).toMatchObject({ available: false, extension: "bin" });
+    expect(storage.readFile).not.toHaveBeenCalled();
+    expect(auditStrict).toHaveBeenCalledWith(expect.objectContaining({
+      action: "FINANCE_INTERNAL_IMPORT_SOURCE_PREVIEW",
+      detail: expect.objectContaining({ fileExtension: "bin" })
+    }));
   });
 
   it("拒绝跨文件重复银行行，且不写原件或数据库", async () => {
@@ -419,5 +558,40 @@ describe("内部财务资料导入", () => {
     expect(deps.auditStrict).toHaveBeenCalledWith(
       expect.objectContaining({ action: "FINANCE_INTERNAL_IMPORT_SOURCE_DOWNLOAD", targetId: "batch-old" })
     );
+  });
+
+  it("读取来源原件前先审计下载尝试，存储读取失败仍留有审计记录", async () => {
+    const { db } = transactionDb();
+    db.financeImportBatch.findUnique.mockResolvedValue({
+      id: "batch-old",
+      kind: "OTHER",
+      createdById: "synthetic-user-2",
+      status: "COMMITTED",
+      sourceFile: {
+        fileName: "synthetic.csv",
+        storagePath: "finance-imports/202609/source.bin",
+        mimeType: "text/csv",
+        byteSize: 12
+      }
+    });
+    const readFile = vi.fn().mockRejectedValue(new Error("synthetic storage failure"));
+    const storage = { ...storageMock(), readFile };
+    const auditStrict = vi.fn().mockResolvedValue(undefined);
+    const deps = depsFor(db, storage);
+    deps.auditStrict = auditStrict;
+    storage.readFile = readFile;
+
+    await expect(downloadFinanceImportSource(
+      "batch-old",
+      { id: "synthetic-user-2", role: "FINANCE" },
+      deps
+    )).rejects.toThrow("synthetic storage failure");
+
+    expect(auditStrict).toHaveBeenCalledWith(expect.objectContaining({
+      action: "FINANCE_INTERNAL_IMPORT_SOURCE_DOWNLOAD_ATTEMPT",
+      targetId: "batch-old",
+      detail: expect.objectContaining({ kind: "OTHER", fileExtension: "csv" })
+    }));
+    expect(auditStrict.mock.invocationCallOrder[0]).toBeLessThan(readFile.mock.invocationCallOrder[0]);
   });
 });

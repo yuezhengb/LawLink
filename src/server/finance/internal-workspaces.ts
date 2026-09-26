@@ -68,6 +68,32 @@ export async function listInternalImportBatches(dependencies: { db?: typeof pris
   return rows.map((row) => ({ ...row, kind: String(row.kind), status: String(row.status), periodStart: toSerializableDate(row.periodStart), periodEnd: toSerializableDate(row.periodEnd), createdAt: row.createdAt.toISOString() }));
 }
 
+export type FinanceImportVisibilitySummary = {
+  bankRowsAwaitingClaim: number;
+  typedRowsAwaitingReview: number;
+  sourceOnlyBatches: number;
+};
+
+export async function getFinanceImportVisibilitySummary(
+  actor: InternalFinanceActor,
+  dependencies: { db?: typeof prisma } = {}
+): Promise<FinanceImportVisibilitySummary> {
+  const grants = { role: actor.role, rolePermissions: actor.rolePermissions ?? undefined };
+  const scope = actor.role === "FINANCE" ? "ALL"
+    : actor.role === "CUSTOM" && (scopeFor(grants, "finance.read") === "ALL" || scopeFor(grants, "finance.import") === "ALL") ? "ALL"
+      : actor.role === "CUSTOM" && scopeFor(grants, "finance.read") === "OWN" ? "OWN"
+        : null;
+  if (!scope) return { bankRowsAwaitingClaim: 0, typedRowsAwaitingReview: 0, sourceOnlyBatches: 0 };
+  const db = dependencies.db ?? prisma;
+  const batchScope = { status: "COMMITTED" as const, ...(scope === "OWN" ? { createdById: actor.id } : {}) };
+  const [bankRowsAwaitingClaim, typedRowsAwaitingReview, sourceOnlyBatches] = await Promise.all([
+    db.financeReconciliationCase.count({ where: { status: "UNRESOLVED", batch: batchScope } }),
+    db.financeImportRecord.count({ where: { reviewStatus: "NEEDS_REVIEW", batch: batchScope } }),
+    db.financeImportBatch.count({ where: { ...batchScope, kind: "OTHER" } })
+  ]);
+  return { bankRowsAwaitingClaim, typedRowsAwaitingReview, sourceOnlyBatches };
+}
+
 export async function getInternalReconciliationQueue(period: string, actor: InternalFinanceActor): Promise<ReconciliationWorkspaceQueue> {
   const { start, end } = financePeriodBounds(period);
   const queue = await listFinanceReconciliationCases({ status: "UNRESOLVED", periodStart: shDayKey(start), periodEnd: shDayKey(end), page: 1, pageSize: 100 }, { actor: actor as FinanceReconciliationActor });

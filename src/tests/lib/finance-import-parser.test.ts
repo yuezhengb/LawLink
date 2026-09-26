@@ -1,9 +1,12 @@
 import ExcelJS from "exceljs";
+import { deflateRawSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import {
   normalizeFinanceRow,
   parseFinanceWorkbook,
-  readFinanceMatrix
+  readFinanceMatrix,
+  readFinanceWorkbookSheets,
+  validateFinanceWorkbookMatrixDimensions
 } from "@/lib/finance/import-parser";
 import { parseFinanceSource } from "@/lib/finance/finance-source-parser";
 
@@ -36,6 +39,56 @@ async function wideFormattedXlsxBuffer(): Promise<Buffer> {
   return Buffer.from(await workbook.xlsx.writeBuffer());
 }
 
+function oversizedZipEntryBuffer(uncompressedSize: number): Buffer {
+  const fileName = Buffer.from("content.xml");
+  const entry = Buffer.alloc(46);
+  entry.writeUInt32LE(0x02014b50, 0);
+  entry.writeUInt16LE(20, 4);
+  entry.writeUInt16LE(20, 6);
+  entry.writeUInt16LE(8, 10);
+  entry.writeUInt32LE(1, 20);
+  entry.writeUInt32LE(uncompressedSize, 24);
+  entry.writeUInt16LE(fileName.length, 28);
+  const centralDirectory = Buffer.concat([entry, fileName]);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(1, 8);
+  end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(centralDirectory.length, 12);
+  return Buffer.concat([centralDirectory, end]);
+}
+
+function zipEntryExceedingDeclaredSizeBuffer(): Buffer {
+  const fileName = Buffer.from("content.xml");
+  const uncompressed = Buffer.alloc(1024, 65);
+  const compressed = deflateRawSync(uncompressed);
+  const localHeader = Buffer.alloc(30);
+  localHeader.writeUInt32LE(0x04034b50, 0);
+  localHeader.writeUInt16LE(20, 4);
+  localHeader.writeUInt16LE(8, 8);
+  localHeader.writeUInt32LE(compressed.byteLength, 18);
+  localHeader.writeUInt32LE(4, 22);
+  localHeader.writeUInt16LE(fileName.length, 26);
+  const localEntry = Buffer.concat([localHeader, fileName, compressed]);
+
+  const centralHeader = Buffer.alloc(46);
+  centralHeader.writeUInt32LE(0x02014b50, 0);
+  centralHeader.writeUInt16LE(20, 4);
+  centralHeader.writeUInt16LE(20, 6);
+  centralHeader.writeUInt16LE(8, 10);
+  centralHeader.writeUInt32LE(compressed.byteLength, 20);
+  centralHeader.writeUInt32LE(4, 24);
+  centralHeader.writeUInt16LE(fileName.length, 28);
+  const centralDirectory = Buffer.concat([centralHeader, fileName]);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(1, 8);
+  end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(centralDirectory.length, 12);
+  end.writeUInt32LE(localEntry.length, 16);
+  return Buffer.concat([localEntry, centralDirectory, end]);
+}
+
 describe("财务来源文件解析", () => {
   it("忽略仅有格式的超宽空尾列", async () => {
     const result = await readFinanceMatrix(await wideFormattedXlsxBuffer(), "工资表.xlsx");
@@ -43,6 +96,30 @@ describe("财务来源文件解析", () => {
     expect(result.errors).toEqual([]);
     expect(result.matrix[0]).toEqual(["日期", "金额"]);
     expect(result.matrix[1]).toEqual(["2026-08-01", "100.00"]);
+  });
+
+  it("在展开压缩内容前拒绝超出大小上限的工作簿", async () => {
+    const result = await readFinanceWorkbookSheets(
+      oversizedZipEntryBuffer(64 * 1024 * 1024 + 1),
+      "oversized.xlsx"
+    );
+
+    expect(result.errors).toMatchObject([
+      expect.objectContaining({ code: "PARSE_FAILURE", message: expect.stringContaining("安全解析限制") })
+    ]);
+  });
+
+  it("按实际解压大小拒绝伪报尺寸的压缩工作簿", async () => {
+    const result = await readFinanceWorkbookSheets(zipEntryExceedingDeclaredSizeBuffer(), "mismatched.xlsx");
+
+    expect(result.errors).toMatchObject([
+      expect.objectContaining({ code: "PARSE_FAILURE", message: expect.stringContaining("安全解析限制") })
+    ]);
+  });
+
+  it("拒绝超过安全稠密矩阵范围的稀疏工作表", () => {
+    expect(() => validateFinanceWorkbookMatrixDimensions(1_048_576, 16_384, 0)).toThrow("工作簿超出安全解析限制");
+    expect(() => validateFinanceWorkbookMatrixDimensions(500, 500, 900_000)).toThrow("工作簿超出安全解析限制");
   });
 
   it("识别借方/贷方并统一为有符号金额", async () => {
@@ -277,6 +354,23 @@ describe("财务来源文件解析", () => {
     expect(result.rows).toEqual([]);
     expect(result.errors[0]).toMatchObject({ code: "UNSUPPORTED_LEGACY_XLS", rowNumber: 0 });
     expect(result.errors[0].message).toContain("XLSX");
+  });
+
+  it("XLSM 来源档案统计全部工作表且不伪造成财务事实", async () => {
+    const workbook = new ExcelJS.Workbook();
+    workbook.addWorksheet("合成一").addRows([["编号", "说明"], ["A-1", "记录一"], ["A-2", "记录二"]]);
+    workbook.addWorksheet("合成二").addRows([["编号", "说明"], ["B-1", "记录三"]]);
+    const bytes = Buffer.from(await workbook.xlsx.writeBuffer());
+
+    const sheets = await readFinanceWorkbookSheets(bytes, "private-source.xlsm");
+    const parsed = await parseFinanceSource(bytes, "private-source.xlsm", "OTHER");
+
+    expect(sheets.errors).toEqual([]);
+    expect(sheets.sheets).toHaveLength(2);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.totalRows).toBe(3);
+    expect(parsed.rows).toEqual([]);
+    expect(parsed.reviewWarnings).toContain("其他资料仅归档原始文件，不会进入银行对账或财务计算。");
   });
 
   it("手工映射仍然经过同一套金额和日期规范化", () => {
