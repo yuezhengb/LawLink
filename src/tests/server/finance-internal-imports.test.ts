@@ -235,6 +235,26 @@ describe("内部财务资料导入", () => {
     expect(storage.writeFile).toHaveBeenCalledTimes(1);
   });
 
+  it("OTHER 工作簿无法解析时仍只保存原件，不制造财务事实", async () => {
+    const { db, tx } = transactionDb();
+    db.financeImportBatch.findUnique.mockResolvedValue(null);
+    const storage = storageMock();
+
+    await expect(commitFinanceImport({
+      fileName: "synthetic-unreadable.xlsx",
+      kind: "OTHER",
+      bytes: Buffer.from("synthetic invalid workbook bytes")
+    }, depsFor(db, storage))).resolves.toMatchObject({ duplicate: false, batchId: "batch-new" });
+
+    expect(tx.financeImportBatch.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ rowCount: 0, periodStart: null, periodEnd: null, kind: "OTHER" })
+    }));
+    expect(tx.financeSourceRow.createMany).not.toHaveBeenCalled();
+    expect(tx.financeReconciliationCase.createMany).not.toHaveBeenCalled();
+    expect(tx.financeImportRecord.createMany).not.toHaveBeenCalled();
+    expect(storage.writeFile).toHaveBeenCalledOnce();
+  });
+
   it("有财务读取权限的人可分页查看只读来源表格且审计不记录单元格内容", async () => {
     const bytes = await twoSheetOtherArchiveBytes();
     const batch = {

@@ -225,10 +225,30 @@ function parseUnstructuredOtherSource(upload: FinanceUploadForParsing) {
 
 async function parseFinanceUpload(upload: FinanceUploadForParsing, dependencies: FinanceImportDependencies) {
   const extension = extensionOf(upload.fileName);
+  if (upload.kind === "OTHER") {
+    const rawOnly = () => ({
+      parsed: parseUnstructuredOtherSource(upload),
+      prepared: {
+        parseBytes: upload.bytes,
+        parseFileName: upload.fileName,
+        pdfCandidates: [],
+        canCommitStructuredRows: true
+      }
+    });
+    if (extension === "xls" || extension === "pdf") return rawOnly();
+
+    try {
+      const prepared = await prepareFinanceSource(upload, dependencies.preprocess);
+      const parsed = await parseFinanceSource(prepared.parseBytes, prepared.parseFileName, upload.kind, upload);
+      if (parsed.errors.length === 0) return { parsed, prepared };
+    } catch {
+      // OTHER files are retained as originals; best-effort sheet parsing must not block archival.
+    }
+    return rawOnly();
+  }
+
   const prepared = await prepareFinanceSource(upload, dependencies.preprocess);
-  const parsed = upload.kind === "OTHER" && (extension === "xls" || extension === "pdf")
-    ? parseUnstructuredOtherSource(upload)
-    : await parseFinanceSource(prepared.parseBytes, prepared.parseFileName, upload.kind, upload);
+  const parsed = await parseFinanceSource(prepared.parseBytes, prepared.parseFileName, upload.kind, upload);
   return { parsed, prepared };
 }
 
