@@ -255,6 +255,20 @@ describe("内部财务资料导入", () => {
     expect(storage.writeFile).toHaveBeenCalledOnce();
   });
 
+  it("原件归档兜底仍拒绝不支持的文件扩展名", async () => {
+    const { db } = transactionDb();
+    const storage = storageMock();
+
+    await expect(commitFinanceImport({
+      fileName: "synthetic-unknown.exe",
+      kind: "OTHER",
+      bytes: Buffer.from("synthetic bytes")
+    }, depsFor(db, storage))).rejects.toThrow("仅支持 CSV、XLSX、XLSM、XLS 或 PDF 文件");
+
+    expect(db.financeImportBatch.findUnique).not.toHaveBeenCalled();
+    expect(storage.writeFile).not.toHaveBeenCalled();
+  });
+
   it("有财务读取权限的人可分页查看只读来源表格且审计不记录单元格内容", async () => {
     const bytes = await twoSheetOtherArchiveBytes();
     const batch = {

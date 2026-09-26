@@ -74,6 +74,9 @@ function mimeTypeOf(fileName: string): string {
   return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 }
 
+const SUPPORTED_SOURCE_EXTENSIONS = new Set(["csv", "xlsx", "xlsm", "xls", "pdf"]);
+const SUPPORTED_SOURCE_EXTENSIONS_MESSAGE = "仅支持 CSV、XLSX、XLSM、XLS 或 PDF 文件";
+
 function safeFileName(fileName: string): string {
   const normalized = fileName
     .replace(/[\u0000-\u001F<>:"/\\|?*]/g, "_")
@@ -137,8 +140,8 @@ async function readUpload(formData: FormData): Promise<{ fileName: string; bytes
   const file = candidate as { name?: unknown; arrayBuffer: () => Promise<ArrayBuffer> };
   const fileName = safeFileName(typeof file.name === "string" ? file.name : "finance-import");
   const extension = extensionOf(fileName);
-  if (extension !== "csv" && extension !== "xlsx" && extension !== "xlsm" && extension !== "xls" && extension !== "pdf") {
-    throw new ActionError("仅支持 CSV、XLSX、XLSM、XLS 或 PDF 文件");
+  if (!SUPPORTED_SOURCE_EXTENSIONS.has(extension)) {
+    throw new ActionError(SUPPORTED_SOURCE_EXTENSIONS_MESSAGE);
   }
   const bytes = Buffer.from(await file.arrayBuffer());
   if (bytes.byteLength === 0 || bytes.byteLength > MAX_FINANCE_IMPORT_BYTES) {
@@ -237,13 +240,9 @@ async function parseFinanceUpload(upload: FinanceUploadForParsing, dependencies:
     });
     if (extension === "xls" || extension === "pdf") return rawOnly();
 
-    try {
-      const prepared = await prepareFinanceSource(upload, dependencies.preprocess);
-      const parsed = await parseFinanceSource(prepared.parseBytes, prepared.parseFileName, upload.kind, upload);
-      if (parsed.errors.length === 0) return { parsed, prepared };
-    } catch {
-      // OTHER files are retained as originals; best-effort sheet parsing must not block archival.
-    }
+    const prepared = await prepareFinanceSource(upload, dependencies.preprocess);
+    const parsed = await parseFinanceSource(prepared.parseBytes, prepared.parseFileName, upload.kind, upload);
+    if (parsed.errors.length === 0) return { parsed, prepared };
     return rawOnly();
   }
 
@@ -472,6 +471,9 @@ export async function commitFinanceImport(
   if (data.bytes.byteLength > MAX_FINANCE_IMPORT_BYTES) throw new ActionError("财务资料不能超过 25 MB");
 
   const fileName = safeFileName(data.fileName);
+  if (!SUPPORTED_SOURCE_EXTENSIONS.has(extensionOf(fileName))) {
+    throw new ActionError(SUPPORTED_SOURCE_EXTENSIONS_MESSAGE);
+  }
   const { parsed, prepared } = await parseFinanceUpload({ ...data, fileName }, dependencies);
   if (!prepared.canCommitStructuredRows) throw new ActionError("PDF 页面未能形成稳定表格；请人工整理后再导入");
   if (parsed.totalRows === 0 && parsed.kind !== "OTHER") throw new ActionError("文件中没有可提交的数据行");
