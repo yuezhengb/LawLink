@@ -48,7 +48,7 @@ describe("内部财务工作区", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "提交到归档" })).toBeEnabled());
   });
 
-  it("案件登记清单只读比对展示案号差异，不启动导入/提交", async () => {
+  it("案件登记清单只读比对展示差异，并仅在用户点击后归档原件", async () => {
     const fetch = vi.spyOn(global, "fetch")
       .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] })))
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -60,12 +60,14 @@ describe("内部财务工作区", () => {
 
     const fileInput = screen.getByLabelText("案件登记清单") as HTMLInputElement;
     expect(fileInput.accept).toContain(".xlsx");
-    fireEvent.change(fileInput, { target: { files: [new File(["synthetic"], "synthetic.xlsx", { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" })] } });
+    expect(fileInput.accept).toContain(".xlsm");
+    fireEvent.change(fileInput, { target: { files: [new File(["synthetic"], "synthetic.xlsm", { type: "application/vnd.ms-excel.sheet.macroEnabled.12" })] } });
     fireEvent.click(screen.getByRole("button", { name: "只读比对" }));
 
     expect(await screen.findByText("SYN-CASE-ONLY")).toBeInTheDocument();
     expect(screen.getByText("SYN-CONTRACT-ONLY")).toBeInTheDocument();
-    expect(screen.getByText(/不创建、修改案件、合同或收付款/)).toBeInTheDocument();
+    expect(screen.getByText(/不创建或修改案件、合同、收付款及账簿事实/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "归档原件并在财务区查看" })).toBeEnabled();
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(fetch.mock.calls[1][0]).toBe("/api/finance/internal/imports/case-register-preview");
   });

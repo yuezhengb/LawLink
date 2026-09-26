@@ -17,9 +17,13 @@ class UploadValidationTests(unittest.TestCase):
 
     def test_rejects_unknown_kind_and_oversized_file(self):
         with self.assertRaises(ValueError):
-            validate_upload_metadata("statement.pdf", "OTHER", 100)
+            validate_upload_metadata("statement.pdf", "UNKNOWN", 100)
         with self.assertRaises(ValueError):
             validate_upload_metadata("statement.pdf", "BANK_STATEMENT", MAX_FILE_BYTES + 1)
+
+    def test_accepts_other_only_for_safe_source_archive_preprocessing(self):
+        self.assertEqual(validate_upload_metadata("source.pdf", "OTHER", 100), ".pdf")
+        self.assertEqual(validate_upload_metadata("source.xls", "OTHER", 100), ".xls")
 
     def test_authentication_uses_exact_bearer_token(self):
         self.assertTrue(is_authorized("Bearer secret-token", "secret-token"))

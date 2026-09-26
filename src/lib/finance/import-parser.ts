@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { Readable } from "node:stream";
+import { createInflateRaw } from "node:zlib";
 import ExcelJS from "exceljs";
 import { shDayKey } from "@/lib/ui/sh-time";
 import type {
@@ -16,6 +18,149 @@ type FinanceField = keyof FinanceColumnMapping;
 type RawRecord = Record<string, unknown>;
 type Matrix = string[][];
 export type FinanceMatrixSheet = { name: string; matrix: Matrix };
+
+const MAX_FINANCE_WORKBOOK_INPUT_BYTES = 25 * 1024 * 1024;
+const MAX_FINANCE_WORKBOOK_UNCOMPRESSED_BYTES = 64 * 1024 * 1024;
+const MAX_FINANCE_WORKBOOK_ENTRY_BYTES = 32 * 1024 * 1024;
+const MAX_FINANCE_WORKBOOK_ENTRIES = 4096;
+const MAX_FINANCE_WORKBOOK_SHEETS = 64;
+const MAX_FINANCE_WORKSHEET_ROWS = 200_000;
+const MAX_FINANCE_WORKSHEET_COLUMNS = 512;
+const MAX_FINANCE_WORKBOOK_NONEMPTY_CELLS = 250_000;
+const MAX_FINANCE_WORKBOOK_MATRIX_CELLS = 1_000_000;
+const MAX_FINANCE_CELL_TEXT_LENGTH = 1_000_000;
+const WORKBOOK_RESOURCE_LIMIT_MESSAGE = "工作簿超出安全解析限制";
+
+class FinanceWorkbookResourceLimitError extends Error {
+  constructor() {
+    super(WORKBOOK_RESOURCE_LIMIT_MESSAGE);
+    this.name = "FinanceWorkbookResourceLimitError";
+  }
+}
+
+export function validateFinanceWorkbookMatrixDimensions(rowCount: number, columnCount: number, allocatedCells: number): number {
+  const matrixCells = rowCount * columnCount;
+  if (
+    !Number.isSafeInteger(rowCount) || !Number.isSafeInteger(columnCount) || !Number.isSafeInteger(allocatedCells) ||
+    rowCount < 0 || columnCount < 0 || allocatedCells < 0 ||
+    rowCount > MAX_FINANCE_WORKSHEET_ROWS || columnCount > MAX_FINANCE_WORKSHEET_COLUMNS ||
+    !Number.isSafeInteger(matrixCells) || matrixCells + allocatedCells > MAX_FINANCE_WORKBOOK_MATRIX_CELLS
+  ) {
+    throw new FinanceWorkbookResourceLimitError();
+  }
+  return matrixCells;
+}
+
+async function countInflatedBytes(compressed: Buffer, maximumBytes: number): Promise<number> {
+  const inflater = createInflateRaw();
+  const output = Readable.from([compressed]).pipe(inflater);
+  let inflatedBytes = 0;
+  try {
+    for await (const chunk of output) {
+      inflatedBytes += chunk.byteLength;
+      if (inflatedBytes > maximumBytes) throw new FinanceWorkbookResourceLimitError();
+    }
+  } catch (caught) {
+    if (caught instanceof FinanceWorkbookResourceLimitError) throw caught;
+    throw new Error("工作簿压缩包无效");
+  } finally {
+    inflater.destroy();
+  }
+  return inflatedBytes;
+}
+
+async function assertSafeFinanceXlsxArchive(bytes: Buffer): Promise<void> {
+  if (bytes.byteLength < 22 || bytes.byteLength > MAX_FINANCE_WORKBOOK_INPUT_BYTES) {
+    throw new FinanceWorkbookResourceLimitError();
+  }
+
+  const minimumEndRecordOffset = Math.max(0, bytes.byteLength - 22 - 0xffff);
+  let endRecordOffset = -1;
+  for (let offset = bytes.byteLength - 22; offset >= minimumEndRecordOffset; offset -= 1) {
+    if (bytes.readUInt32LE(offset) !== 0x06054b50) continue;
+    if (offset + 22 + bytes.readUInt16LE(offset + 20) === bytes.byteLength) {
+      endRecordOffset = offset;
+      break;
+    }
+  }
+  if (endRecordOffset < 0) throw new Error("工作簿压缩包无效");
+
+  const diskNumber = bytes.readUInt16LE(endRecordOffset + 4);
+  const centralDirectoryDisk = bytes.readUInt16LE(endRecordOffset + 6);
+  const entriesOnDisk = bytes.readUInt16LE(endRecordOffset + 8);
+  const entryCount = bytes.readUInt16LE(endRecordOffset + 10);
+  const centralDirectorySize = bytes.readUInt32LE(endRecordOffset + 12);
+  const centralDirectoryOffset = bytes.readUInt32LE(endRecordOffset + 16);
+  const centralDirectoryEnd = centralDirectoryOffset + centralDirectorySize;
+
+  if (
+    diskNumber !== 0 || centralDirectoryDisk !== 0 || entriesOnDisk !== entryCount || entryCount === 0 ||
+    entryCount === 0xffff || centralDirectorySize === 0xffffffff || centralDirectoryOffset === 0xffffffff ||
+    entryCount > MAX_FINANCE_WORKBOOK_ENTRIES || centralDirectoryEnd > endRecordOffset
+  ) {
+    throw new FinanceWorkbookResourceLimitError();
+  }
+
+  let cursor = centralDirectoryOffset;
+  let totalUncompressedBytes = 0;
+  for (let index = 0; index < entryCount; index += 1) {
+    if (cursor + 46 > centralDirectoryEnd || bytes.readUInt32LE(cursor) !== 0x02014b50) {
+      throw new Error("工作簿压缩包无效");
+    }
+    const flags = bytes.readUInt16LE(cursor + 8);
+    const compressionMethod = bytes.readUInt16LE(cursor + 10);
+    const compressedSize = bytes.readUInt32LE(cursor + 20);
+    const uncompressedSize = bytes.readUInt32LE(cursor + 24);
+    const fileNameLength = bytes.readUInt16LE(cursor + 28);
+    const extraLength = bytes.readUInt16LE(cursor + 30);
+    const commentLength = bytes.readUInt16LE(cursor + 32);
+    const diskStart = bytes.readUInt16LE(cursor + 34);
+    const localHeaderOffset = bytes.readUInt32LE(cursor + 42);
+    const recordEnd = cursor + 46 + fileNameLength + extraLength + commentLength;
+    if (recordEnd > centralDirectoryEnd) throw new Error("工作簿压缩包无效");
+    if (
+      (flags & 1) !== 0 || diskStart !== 0 || compressedSize === 0xffffffff ||
+      uncompressedSize === 0xffffffff || localHeaderOffset === 0xffffffff ||
+      uncompressedSize > MAX_FINANCE_WORKBOOK_ENTRY_BYTES ||
+      totalUncompressedBytes + uncompressedSize > MAX_FINANCE_WORKBOOK_UNCOMPRESSED_BYTES
+    ) {
+      throw new FinanceWorkbookResourceLimitError();
+    }
+    if (compressionMethod !== 0 && compressionMethod !== 8) throw new Error("工作簿压缩格式不受支持");
+
+    if (localHeaderOffset + 30 > centralDirectoryOffset || bytes.readUInt32LE(localHeaderOffset) !== 0x04034b50) {
+      throw new Error("工作簿压缩包无效");
+    }
+    const localFlags = bytes.readUInt16LE(localHeaderOffset + 6);
+    const localCompressionMethod = bytes.readUInt16LE(localHeaderOffset + 8);
+    const localFileNameLength = bytes.readUInt16LE(localHeaderOffset + 26);
+    const localExtraLength = bytes.readUInt16LE(localHeaderOffset + 28);
+    const dataStart = localHeaderOffset + 30 + localFileNameLength + localExtraLength;
+    const dataEnd = dataStart + compressedSize;
+    const centralFileName = bytes.subarray(cursor + 46, cursor + 46 + fileNameLength);
+    const localFileName = bytes.subarray(localHeaderOffset + 30, localHeaderOffset + 30 + localFileNameLength);
+    if (
+      (localFlags & 1) !== 0 || localCompressionMethod !== compressionMethod ||
+      localFileNameLength !== fileNameLength || !localFileName.equals(centralFileName) ||
+      dataStart > centralDirectoryOffset || dataEnd > centralDirectoryOffset || dataEnd > bytes.byteLength
+    ) {
+      throw new Error("工作簿压缩包无效");
+    }
+
+    const compressed = bytes.subarray(dataStart, dataEnd);
+    const actualUncompressedSize = compressionMethod === 0
+      ? compressed.byteLength
+      : await countInflatedBytes(compressed, Math.min(
+        uncompressedSize,
+        MAX_FINANCE_WORKBOOK_ENTRY_BYTES,
+        MAX_FINANCE_WORKBOOK_UNCOMPRESSED_BYTES - totalUncompressedBytes
+      ));
+    if (actualUncompressedSize !== uncompressedSize) throw new Error("工作簿压缩包无效");
+    totalUncompressedBytes += actualUncompressedSize;
+    cursor = recordEnd;
+  }
+  if (cursor !== centralDirectoryEnd) throw new Error("工作簿压缩包无效");
+}
 
 type NormalizationOptions = {
   sourceKind: FinanceSourceKind;
@@ -378,67 +523,98 @@ function parseCsv(text: string): Matrix {
   let cell = "";
   let quoted = false;
   const content = text.replace(/^\uFEFF/, "");
+  let allocatedCells = 0;
+
+  const pushCell = () => {
+    if (cell.length > MAX_FINANCE_CELL_TEXT_LENGTH || row.length >= MAX_FINANCE_WORKSHEET_COLUMNS) {
+      throw new FinanceWorkbookResourceLimitError();
+    }
+    allocatedCells += 1;
+    if (allocatedCells > MAX_FINANCE_WORKBOOK_MATRIX_CELLS) throw new FinanceWorkbookResourceLimitError();
+    row.push(cell);
+    cell = "";
+  };
+
+  const pushRow = () => {
+    pushCell();
+    rows.push(row);
+    if (rows.length > MAX_FINANCE_WORKSHEET_ROWS) throw new FinanceWorkbookResourceLimitError();
+    row = [];
+  };
 
   for (let index = 0; index < content.length; index += 1) {
     const character = content[index];
     if (character === '"') {
       if (quoted && content[index + 1] === '"') {
         cell += '"';
+        if (cell.length > MAX_FINANCE_CELL_TEXT_LENGTH) throw new FinanceWorkbookResourceLimitError();
         index += 1;
       } else {
         quoted = !quoted;
       }
     } else if (character === "," && !quoted) {
-      row.push(cell);
-      cell = "";
+      pushCell();
     } else if ((character === "\n" || character === "\r") && !quoted) {
       if (character === "\r" && content[index + 1] === "\n") index += 1;
-      row.push(cell);
-      rows.push(row);
-      row = [];
-      cell = "";
+      pushRow();
     } else {
       cell += character;
+      if (cell.length > MAX_FINANCE_CELL_TEXT_LENGTH) throw new FinanceWorkbookResourceLimitError();
     }
   }
 
   if (cell.length > 0 || row.length > 0) {
-    row.push(cell);
-    rows.push(row);
+    pushRow();
   }
   return rows;
 }
 
 async function readXlsxSheets(bytes: Buffer): Promise<FinanceMatrixSheet[]> {
+  await assertSafeFinanceXlsxArchive(bytes);
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(bytes as unknown as ArrayBuffer);
-  return workbook.worksheets.map((sheet) => {
-  const rows = new Map<number, Map<number, string>>();
-  let maxRowNumber = 0;
-  let maxColumnNumber = 0;
+  if (workbook.worksheets.length > MAX_FINANCE_WORKBOOK_SHEETS) throw new FinanceWorkbookResourceLimitError();
 
-  // ExcelJS columnCount can be inflated by formatting-only cells. Iterate only
-  // through populated cells, but retain original row numbers for audit errors.
-  sheet.eachRow({ includeEmpty: false }, (row) => {
-    const values = new Map<number, string>();
-    row.eachCell({ includeEmpty: false }, (cell, columnNumber) => {
-      const value = cellToText(cell.value);
-      if (!value) return;
-      values.set(columnNumber, value);
-      maxColumnNumber = Math.max(maxColumnNumber, columnNumber);
+  const sheets: FinanceMatrixSheet[] = [];
+  let allocatedMatrixCells = 0;
+  let nonemptyCellCount = 0;
+  for (const sheet of workbook.worksheets) {
+    const rows = new Map<number, Map<number, string>>();
+    let maxRowNumber = 0;
+    let maxColumnNumber = 0;
+
+    // ExcelJS columnCount can be inflated by formatting-only cells. Iterate only
+    // populated cells, but cap dimensions and work before allocating the dense matrix.
+    sheet.eachRow({ includeEmpty: false }, (row) => {
+      if (row.number > MAX_FINANCE_WORKSHEET_ROWS) throw new FinanceWorkbookResourceLimitError();
+      const values = new Map<number, string>();
+      row.eachCell({ includeEmpty: false }, (cell, columnNumber) => {
+        if (columnNumber > MAX_FINANCE_WORKSHEET_COLUMNS) throw new FinanceWorkbookResourceLimitError();
+        const value = cellToText(cell.value);
+        if (!value) return;
+        if (value.length > MAX_FINANCE_CELL_TEXT_LENGTH) throw new FinanceWorkbookResourceLimitError();
+        nonemptyCellCount += 1;
+        if (nonemptyCellCount > MAX_FINANCE_WORKBOOK_NONEMPTY_CELLS) throw new FinanceWorkbookResourceLimitError();
+        values.set(columnNumber, value);
+        maxColumnNumber = Math.max(maxColumnNumber, columnNumber);
+      });
+      if (values.size === 0) return;
+      rows.set(row.number, values);
+      maxRowNumber = Math.max(maxRowNumber, row.number);
     });
-    if (values.size === 0) return;
-    rows.set(row.number, values);
-    maxRowNumber = Math.max(maxRowNumber, row.number);
-  });
 
-  if (maxRowNumber === 0 || maxColumnNumber === 0) return { name: sheet.name, matrix: [] };
-  const matrix: Matrix = Array.from({ length: maxRowNumber }, () => Array(maxColumnNumber).fill(""));
-  for (const [rowNumber, values] of rows) {
-    for (const [columnNumber, value] of values) matrix[rowNumber - 1][columnNumber - 1] = value;
+    if (maxRowNumber === 0 || maxColumnNumber === 0) {
+      sheets.push({ name: sheet.name, matrix: [] });
+      continue;
+    }
+    allocatedMatrixCells += validateFinanceWorkbookMatrixDimensions(maxRowNumber, maxColumnNumber, allocatedMatrixCells);
+    const matrix: Matrix = Array.from({ length: maxRowNumber }, () => Array(maxColumnNumber).fill(""));
+    for (const [rowNumber, values] of rows) {
+      for (const [columnNumber, value] of values) matrix[rowNumber - 1][columnNumber - 1] = value;
+    }
+    sheets.push({ name: sheet.name, matrix });
   }
-  return { name: sheet.name, matrix };
-  });
+  return sheets;
 }
 
 export async function readFinanceWorkbookSheets(bytes: Buffer, fileName: string): Promise<{ sheets: FinanceMatrixSheet[]; errors: FinanceRowError[] }> {
@@ -449,10 +625,11 @@ export async function readFinanceWorkbookSheets(bytes: Buffer, fileName: string)
       errors: [error(0, "UNSUPPORTED_LEGACY_XLS", "传统 XLS 格式需要先通过隔离预处理服务转换为 XLSX。")]
     };
   }
-  if (extension !== "csv" && extension !== "xlsx") {
-    return { sheets: [], errors: [error(0, "UNSUPPORTED_FILE_FORMAT", "仅支持 CSV 或 XLSX 文件")] };
+  if (extension !== "csv" && extension !== "xlsx" && extension !== "xlsm") {
+    return { sheets: [], errors: [error(0, "UNSUPPORTED_FILE_FORMAT", "仅支持 CSV、XLSX 或 XLSM 文件")] };
   }
   try {
+    if (bytes.byteLength > MAX_FINANCE_WORKBOOK_INPUT_BYTES) throw new FinanceWorkbookResourceLimitError();
     const sheets = extension === "csv"
       ? [{ name: "CSV", matrix: parseCsv(bytes.toString("utf8")) }]
       : await readXlsxSheets(bytes);

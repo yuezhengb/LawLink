@@ -86,6 +86,7 @@ type Props = {
   canApproveInvoice: boolean;
   canExport: boolean;
   canInternalRead: boolean;
+  internalImportStatus: { bankRowsAwaitingClaim: number; typedRowsAwaitingReview: number; sourceOnlyBatches: number } | null;
   canWrite: boolean;
   /** 能否确认 / 退回律师登记的实收（财务、主任、管理员） */
   canConfirmReceipt: boolean;
@@ -104,7 +105,7 @@ const TYPE_META: Record<Entry["type"], { label: string; badge: string; sign: str
 const yuan = (n: number, digits = 0) => `¥${n.toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
 const mmdd = (d: Date | string) => shMonthDay(d);
 
-export function FinanceViewV4({ entries, monthly, aging, stats, invoiceRequests, pendingEntries, commissionEntries: commissionRows, invoiceReconciliation, canApproveInvoice, canExport, canInternalRead, canWrite, canConfirmReceipt }: Props) {
+export function FinanceViewV4({ entries, monthly, aging, stats, invoiceRequests, pendingEntries, commissionEntries: commissionRows, invoiceReconciliation, canApproveInvoice, canExport, canInternalRead, internalImportStatus, canWrite, canConfirmReceipt }: Props) {
   const params = useSearchParams();
   const initialTab = (["ledger", "invoices", "commission", "aging"] as Tab[]).includes(params.get("tab") as Tab) ? (params.get("tab") as Tab) : "ledger";
   const [tab, setTab] = useState<Tab>(initialTab);
@@ -187,6 +188,19 @@ export function FinanceViewV4({ entries, monthly, aging, stats, invoiceRequests,
       />
 
       {canInternalRead ? <div className="card flex flex-wrap items-center justify-between gap-3 border-[var(--teal-line)] bg-[var(--teal-soft)] px-4 py-3.5"><div><div className="text-[13px] font-[600] text-[var(--teal-deep)]">内部经营财务工作区</div><div className="mt-1 text-[11.5px] text-[var(--t-secondary)]">管理银行来源、人工认领、分成快照与月结交付；不改变案件应收和开票口径。</div></div><Link href="/finance/internal" className="btn btn-primary btn-sm">进入工作区 →</Link></div> : null}
+
+      {canInternalRead && internalImportStatus && Object.values(internalImportStatus).some((count) => count > 0) ? <div className="card flex flex-wrap items-center justify-between gap-3 border-[var(--amber-line)] bg-[var(--amber-bg)] px-4 py-3.5" role="status">
+        <div className="min-w-[240px] flex-1">
+          <div className="text-[13px] font-[600] text-[var(--amber)]">已导入真实来源，待核对部分尚未计入台账</div>
+          <div className="mt-1 text-[11.5px] leading-relaxed text-[var(--t-secondary)]">
+            {internalImportStatus.bankRowsAwaitingClaim ? `${internalImportStatus.bankRowsAwaitingClaim} 条银行流水待认领 · ` : ""}
+            {internalImportStatus.typedRowsAwaitingReview ? `${internalImportStatus.typedRowsAwaitingReview} 条类型化资料待复核 · ` : ""}
+            {internalImportStatus.sourceOnlyBatches ? `${internalImportStatus.sourceOnlyBatches} 份资料仅保存原件` : ""}
+            。首页金额只统计已确认业务记录，不代表来源文件不存在。
+          </div>
+        </div>
+        <Link href="/finance/internal/imports" className="btn btn-secondary btn-sm">查看资料和原表 →</Link>
+      </div> : null}
 
       <div className="kpi-grid">
         <MetricCard

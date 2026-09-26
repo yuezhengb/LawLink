@@ -70,6 +70,7 @@ export function ImportWorkspace({ batches, reviewRecords, reviewUsers, canImport
   const [caseRegisterFile, setCaseRegisterFile] = useState<File | null>(null);
   const [caseRegisterResult, setCaseRegisterResult] = useState<CaseRegisterPreviewResult | null>(null);
   const [caseRegisterBusy, setCaseRegisterBusy] = useState(false);
+  const [caseRegisterArchiving, setCaseRegisterArchiving] = useState(false);
 
   useEffect(() => {
     if (!canImport) return;
@@ -193,6 +194,25 @@ export function ImportWorkspace({ batches, reviewRecords, reviewUsers, canImport
     }
   }
 
+  async function archiveCaseRegister() {
+    if (!caseRegisterFile || !caseRegisterResult) return;
+    setCaseRegisterArchiving(true);
+    try {
+      const form = new FormData();
+      form.append("file", caseRegisterFile);
+      form.append("kind", "OTHER");
+      const result = await readJson(await fetch("/api/finance/internal/imports/commit", { method: "POST", body: form }));
+      toast.success(result.duplicate ? "该清单原件已归档，可在来源列表查看" : "清单原件已归档，可在来源列表查看；未写入案件或账簿");
+      setCaseRegisterFile(null);
+      setCaseRegisterResult(null);
+      window.location.reload();
+    } catch (error) {
+      toast.error(actionErrorMessage(error));
+    } finally {
+      setCaseRegisterArchiving(false);
+    }
+  }
+
   return (
     <div className="space-y-4">
       <Panel
@@ -211,7 +231,7 @@ export function ImportWorkspace({ batches, reviewRecords, reviewUsers, canImport
               </label>
               <label className="block space-y-1.5 text-[12px] font-[550] text-[var(--t-secondary)]">
                 <span>来源文件</span>
-                <Input aria-label="来源文件" type="file" accept=".csv,.xlsx,.xls,.pdf" onChange={(event) => { setFile(event.target.files?.[0] ?? null); setPreview(null); setColumnMappingsBySheet({}); setMappingDirty(false); }} />
+              <Input aria-label="来源文件" type="file" accept=".csv,.xlsx,.xlsm,.xls,.pdf" onChange={(event) => { setFile(event.target.files?.[0] ?? null); setPreview(null); setColumnMappingsBySheet({}); setMappingDirty(false); }} />
               </label>
               {kind === "ROSTER" ? (
                 <label className="block space-y-1.5 text-[12px] font-[550] text-[var(--t-secondary)]">
@@ -228,7 +248,7 @@ export function ImportWorkspace({ batches, reviewRecords, reviewUsers, canImport
                 <Eye aria-hidden="true" />{busy === "preview" ? "预览中…" : preview ? "重新预览" : "上传并预览"}
               </Button>
             </div>
-            <p className="text-[11.5px] leading-relaxed text-[var(--t-muted)]">支持 CSV、XLSX、传统 XLS 和 PDF。预览不会写入归档；无法稳定识别的 PDF 页面不会提交为财务记录。</p>
+            <p className="text-[11.5px] leading-relaxed text-[var(--t-muted)]">支持 CSV、XLSX、XLSM、传统 XLS 和 PDF。预览不会写入归档；“其他财务资料”只保存原件，不进入案件、收付款或财务计算。</p>
             {preview ? <PreviewBlock
               preview={preview}
               busy={busy}
@@ -261,7 +281,7 @@ export function ImportWorkspace({ batches, reviewRecords, reviewUsers, canImport
               <Eye aria-hidden="true" />{caseRegisterBusy ? "比对中…" : "只读比对"}
             </Button>
           </div>
-          <p className="text-[11.5px] leading-relaxed text-[var(--t-muted)]">仅按案号与系统案号精确核对。合同编号因系统案件数据没有独立合同号字段，只作清单参考；不读取或展示客户名称，不创建、修改案件、合同或收付款。</p>
+          <p className="text-[11.5px] leading-relaxed text-[var(--t-muted)]">比对仅按案号精确核对，不读取或展示客户名称；归档后可在下方查看原表。原件只进入受权限保护的来源档案，不创建或修改案件、合同、收付款及账簿事实。</p>
           {caseRegisterResult ? <div className="space-y-3" aria-label="案件清单比对结果">
             <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-6">
               {[["清单行", caseRegisterResult.counts.totalRows], ["可比案号", caseRegisterResult.counts.comparableRows], ["匹配", caseRegisterResult.counts.matched], ["仅在清单", caseRegisterResult.counts.registerOnly], ["仅在系统", caseRegisterResult.counts.systemOnly], ["重复案号", caseRegisterResult.counts.duplicateRegister]].map(([label, count]) => <div key={label} className="rounded-[8px] border border-[var(--bd-hair)] bg-[var(--bg-sunken)] px-3 py-2"><div className="text-[10.5px] text-[var(--t-muted)]">{label}</div><div className="mt-1 text-[16px] font-[650] tabular-nums">{count}</div></div>)}
@@ -275,6 +295,9 @@ export function ImportWorkspace({ batches, reviewRecords, reviewUsers, canImport
               </table>
             </div> : <p className="text-[12px] text-[var(--t-muted)]">没有案号差异。</p>}
             {caseRegisterResult.counts.registerOnly + caseRegisterResult.counts.systemOnly + caseRegisterResult.counts.duplicateRegister > caseRegisterResult.differences.length ? <p className="text-[11px] text-[var(--t-muted)]">差异明细最多显示 500 条，汇总计数覆盖全部可识别行。</p> : null}
+            <Button type="button" variant="approve" onClick={() => void archiveCaseRegister()} disabled={caseRegisterArchiving || caseRegisterBusy}>
+              <Archive aria-hidden="true" />{caseRegisterArchiving ? "归档中…" : "归档原件并在财务区查看"}
+            </Button>
           </div> : null}
         </div> : <p className="text-[12px] text-[var(--t-muted)]">当前账号没有案件清单核对权限。</p>}
       </Panel>
@@ -294,7 +317,10 @@ export function ImportWorkspace({ batches, reviewRecords, reviewUsers, canImport
                 <Tag tone={batch.status === "COMMITTED" ? "green" : "amber"} dot>{batch.status === "COMMITTED" ? "已归档" : batch.status}</Tag>
                 <span className="font-mono text-[10.5px] text-[var(--t-faint)]" title={batch.id}>{maskId(batch.id)}</span>
                 {batch.errorCount > 0 ? <Tag tone="red"><XCircle className="mr-1 inline h-3 w-3" aria-hidden="true" />{batch.errorCount} 行错误</Tag> : <Tag tone="slate"><CheckCircle2 className="mr-1 inline h-3 w-3" aria-hidden="true" />无行错误</Tag>}
-                {batch.status === "COMMITTED" ? <a href={`/api/finance/internal/imports/${encodeURIComponent(batch.id)}/source`} className="btn btn-secondary btn-sm">下载来源</a> : null}
+                {batch.status === "COMMITTED" ? <>
+                  <a href={`/finance/internal/imports/${encodeURIComponent(batch.id)}`} className="btn btn-secondary btn-sm">查看数据</a>
+                  <a href={`/api/finance/internal/imports/${encodeURIComponent(batch.id)}/source`} className="btn btn-secondary btn-sm">下载来源</a>
+                </> : null}
               </div>
             ))}
           </div>
@@ -395,7 +421,7 @@ function PreviewBlock({
     && preview.canCommitStructuredRows !== false
     && !preview.sheets?.some((sheet) => sheet.missingFields.length > 0)
     && preview.errors.length === 0
-    && preview.validCount > 0;
+    && (preview.validCount > 0 || preview.kind === "OTHER");
   return (
     <div className="rounded-[10px] border border-[var(--bd-subtle)] bg-[var(--bg-sunken)] p-3.5">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -408,6 +434,7 @@ function PreviewBlock({
         </Button>
       </div>
       {mappingDirty ? <div role="status" className="mt-2 rounded-[7px] bg-[var(--amber-bg)] px-2.5 py-2 text-[11.5px] text-[var(--amber)]">字段映射已更改，请重新预览后再提交。</div> : null}
+      {preview.kind === "OTHER" ? <div className="mt-2 rounded-[7px] border border-[var(--bd-hair)] bg-card px-2.5 py-2 text-[11.5px] text-[var(--t-secondary)]">仅归档原件及可读取行数，不会转成案件、收付款、开票或财务计算记录。</div> : null}
       {preview.sheets?.map((sheet) => <MappingSheetCard
         key={sheet.sourceSheet}
         kind={preview.kind}

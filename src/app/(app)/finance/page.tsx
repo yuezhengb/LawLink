@@ -10,15 +10,16 @@ import { listInvoiceRequests, getInvoiceStats } from "@/server/invoices/actions"
 import { getInvoiceReconciliation } from "@/server/finance/invoice-reconciliation";
 import { getReceivablesAging } from "@/server/finance/aging";
 import { hasCustomPermission } from "@/lib/roles/catalog";
-import { canReadInternalFinance } from "@/server/finance/internal-workspaces";
+import { canReadInternalFinance, getFinanceImportVisibilitySummary } from "@/server/finance/internal-workspaces";
 import { canConfirmReceipt, isManager } from "@/lib/permissions";
 import { FinanceViewV4 } from "./_components/finance-view-v4";
 
 export default async function FinancePage() {
   const session = await getSession();
   const userId = session!.user.id;
+  const internalRead = canReadInternalFinance(session!.user);
 
-  const [entries, pending, commissions, kpis, monthly, personal, invoiceRequests, invoiceStats, aging, invoiceReconciliation] = await Promise.all([
+  const [entries, pending, commissions, kpis, monthly, personal, invoiceRequests, invoiceStats, aging, invoiceReconciliation, importVisibility] = await Promise.all([
     listAllFeeEntries({ limit: 500 }),
     listPendingReceipts(),
     listAllFeeEntries({ type: "COMMISSION", limit: 500 }),
@@ -28,7 +29,8 @@ export default async function FinancePage() {
     listInvoiceRequests(),
     getInvoiceStats(),
     getReceivablesAging(),
-    getInvoiceReconciliation()
+    getInvoiceReconciliation(),
+    internalRead ? getFinanceImportVisibilitySummary(session!.user) : Promise.resolve(null)
   ]);
 
   const { monthlyReceived, monthlyReceivable, lastMonthReceived, yearlyReceived, yearlyReceivable, monthConfirmedCount, monthPendingCount, monthPendingAmount, monthRefundAmount, writeOffRate } = kpis;
@@ -53,7 +55,8 @@ export default async function FinancePage() {
       monthly={monthly.slice(-6)}
       aging={aging}
       invoiceReconciliation={invoiceReconciliation}
-      canInternalRead={canReadInternalFinance(session!.user)}
+      canInternalRead={internalRead}
+      internalImportStatus={importVisibility}
       canExport={hasCustomPermission(session!.user, "reports.export")}
       canWrite={hasCustomPermission(session!.user, "finance.write")}
       canConfirmReceipt={canConfirmReceipt(session!.user)}
