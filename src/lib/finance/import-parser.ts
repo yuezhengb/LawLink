@@ -225,6 +225,26 @@ function cellToText(value: unknown): string {
   return normalizeWhitespace(String(value));
 }
 
+function formattedFinanceNumber(value: unknown, numberFormat = ""): string | null {
+  const numericValue = typeof value === "number"
+    ? value
+    : value && typeof value === "object" && "result" in value && typeof value.result === "number"
+      ? value.result
+      : null;
+  if (numericValue === null || !Number.isFinite(numericValue)) return null;
+
+  const positiveFormat = (numberFormat.split(";")[0] ?? "").replace(/"[^"]*"/g, "");
+  if (positiveFormat.includes("%") || /E[+-]?0/i.test(positiveFormat)) return null;
+  const decimalPlaces = /\.([0]+)/.exec(positiveFormat)?.[1]?.length;
+  if (decimalPlaces === undefined || decimalPlaces > 8) return null;
+
+  return new Intl.NumberFormat("en-US", {
+    useGrouping: positiveFormat.includes(","),
+    minimumFractionDigits: decimalPlaces,
+    maximumFractionDigits: decimalPlaces
+  }).format(numericValue);
+}
+
 function hashText(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
@@ -325,7 +345,19 @@ function parseMoney(value: unknown): ParsedMoney | "EMPTY" | "INVALID" {
 
   const negative = parenthesized || text.startsWith("-");
   text = text.replace(/^[+-]/, "");
-  if (!/^\d+(?:\.\d+)?$/.test(text)) return "INVALID";
+  if (!/^\d+(?:\.\d+)?$/.test(text)) {
+    const numericTokens = [...original.matchAll(/[+-]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?/g)];
+    if (numericTokens.length !== 1) return "INVALID";
+    const token = numericTokens[0];
+    const prefix = original.slice(0, token.index);
+    const suffix = original.slice(token.index + token[0].length).replace(/\s/g, "");
+    if (
+      !/[￥¥]/u.test(prefix) || !/^元(?:整)?$/u.test(suffix) ||
+      !/^[\p{Script=Han}￥¥\s:：,，（）()]*$/u.test(prefix) ||
+      /[收支借贷付款入出扣消费转进提费还退]/u.test(prefix)
+    ) return "INVALID";
+    return parseMoney(token[0]);
+  }
   const [integerPart, decimalPart = ""] = text.split(".");
   if (decimalPart.length > 2) return "INVALID";
   const integer = integerPart.replace(/^0+(?=\d)/, "") || "0";
@@ -590,7 +622,7 @@ async function readXlsxSheets(bytes: Buffer): Promise<FinanceMatrixSheet[]> {
       const values = new Map<number, string>();
       row.eachCell({ includeEmpty: false }, (cell, columnNumber) => {
         if (columnNumber > MAX_FINANCE_WORKSHEET_COLUMNS) throw new FinanceWorkbookResourceLimitError();
-        const value = cellToText(cell.value);
+        const value = formattedFinanceNumber(cell.value, cell.numFmt) ?? cellToText(cell.value);
         if (!value) return;
         if (value.length > MAX_FINANCE_CELL_TEXT_LENGTH) throw new FinanceWorkbookResourceLimitError();
         nonemptyCellCount += 1;

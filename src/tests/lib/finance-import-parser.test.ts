@@ -142,6 +142,73 @@ describe("财务来源文件解析", () => {
     expect(result.errors).toEqual([]);
   });
 
+  it("识别带中文大写注记和元整后缀的单一人民币金额", async () => {
+    const result = await parseFinanceWorkbook(
+      await xlsxBuffer([
+        ["交易日期", "交易金额"],
+        ["2026-08-03", "壹仟贰佰元整￥1,234.50元"]
+      ]),
+      "银行流水.xlsx",
+      "BANK_STATEMENT"
+    );
+
+    expect(result.rows).toMatchObject([{ amount: "1234.50", direction: "CREDIT" }]);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("不会把金额栏里的支出说明误读为正向收款", async () => {
+    const result = await parseFinanceWorkbook(
+      await xlsxBuffer([
+        ["交易日期", "交易金额"],
+        ["2026-08-03", "支出￥100.00元"],
+        ["2026-08-03", "手续费￥20.00元"],
+        ["2026-08-03", "提现￥30.00元"],
+        ["2026-08-03", "进账￥40.00元"]
+      ]),
+      "银行流水.xlsx",
+      "BANK_STATEMENT"
+    );
+
+    expect(result.rows).toEqual([]);
+    expect(result.errors).toMatchObject([
+      { code: "INVALID_AMOUNT", rowNumber: 2 },
+      { code: "INVALID_AMOUNT", rowNumber: 3 },
+      { code: "INVALID_AMOUNT", rowNumber: 4 },
+      { code: "INVALID_AMOUNT", rowNumber: 5 }
+    ]);
+  });
+
+  it("按工作簿两位小数格式读取公式计算结果", async () => {
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Sheet1");
+    sheet.addRow(["日期", "金额"]);
+    sheet.addRow(["2026-08-03", null]);
+    const amount = sheet.getCell("B2");
+    amount.value = { formula: "1+1", result: 1.9999999999999 };
+    amount.numFmt = "#,##0.00";
+
+    const result = await readFinanceWorkbookSheets(
+      Buffer.from(await workbook.xlsx.writeBuffer()),
+      "工资表.xlsx"
+    );
+
+    expect(result.errors).toEqual([]);
+    expect(result.sheets[0]?.matrix[1]?.[1]).toBe("2.00");
+  });
+
+  it("保留未设置数字格式的 Excel 数值", async () => {
+    const result = await readFinanceWorkbookSheets(
+      await xlsxBuffer([
+        ["日期", "金额"],
+        ["2026-08-03", 1200]
+      ]),
+      "银行流水.xlsx"
+    );
+
+    expect(result.errors).toEqual([]);
+    expect(result.sheets[0]?.matrix[1]?.[1]).toBe("1200");
+  });
+
   it("识别借方支出并保留负号", async () => {
     const result = await parseFinanceWorkbook(
       await xlsxBuffer([
